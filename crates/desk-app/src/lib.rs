@@ -1,15 +1,68 @@
+mod credentials;
+
 use desk_core::{Book, BookSummary, BookmarkEntry, Mark, Preferences, Store};
-use readio_speech::{SpeechAudio, SpeechService, Voice};
+use readio_speech::{OpenRouterModel, SpeechAudio, SpeechService, Voice};
 use serde::Serialize;
 use std::{
     path::Path,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tauri::{Manager, State};
 
 struct AppState {
     store: Arc<Mutex<Store>>,
     speech: SpeechService,
+    openrouter_catalog: tokio::sync::Mutex<Option<CachedCatalog>>,
+}
+struct CachedCatalog {
+    fetched_at: Instant,
+    models: Vec<OpenRouterModel>,
+}
+const CATALOG_TTL: Duration = Duration::from_mins(10);
+const LEGACY_FISH_VOICE: &str = "openrouter:fish-audio/s2.1-pro-free:free";
+fn migrate_provider(preferences: &mut Preferences) -> bool {
+    if preferences.voice.as_deref() != Some(LEGACY_FISH_VOICE) {
+        return false;
+    }
+    preferences.voice = Some("openrouter".into());
+    if preferences.open_router_model.is_none() {
+        preferences.open_router_model = Some("fish-audio/s2.1-pro-free:free".into());
+    }
+    true
+}
+async fn catalog(
+    state: &AppState,
+    refresh: bool,
+    require_key: bool,
+) -> IpcResult<(Vec<OpenRouterModel>, Option<zeroize::Zeroizing<String>>)> {
+    let mut cache = state.openrouter_catalog.lock().await;
+    if refresh {
+        *cache = None;
+    }
+    let api_key = tauri::async_runtime::spawn_blocking(credentials::read)
+        .await
+        .map_err(|e| e.to_string())??;
+    if require_key && api_key.is_none() {
+        return Err("Добавьте ключ OpenRouter в настройках".into());
+    }
+    if !refresh
+        && let Some(entry) = cache.as_ref()
+        && entry.fetched_at.elapsed() < CATALOG_TTL
+    {
+        return Ok((entry.models.clone(), api_key));
+    }
+    let models = state
+        .speech
+        .openrouter_models(api_key.as_ref().map(|key| key.as_str()))
+        .await
+        .map_err(|e| e.to_string())?;
+    *cache = Some(CachedCatalog {
+        fetched_at: Instant::now(),
+        models: models.clone(),
+    });
+    drop(cache);
+    Ok((models, api_key))
 }
 type IpcResult<T> = Result<T, String>;
 fn with_store<T>(
@@ -20,33 +73,52 @@ fn with_store<T>(
     f(&store).map_err(|e| e.to_string())
 }
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Bootstrap {
     books: Vec<BookSummary>,
     preferences: Preferences,
     voices: Vec<Voice>,
     warnings: Vec<String>,
+    open_router: OpenRouterStatus,
 }
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenRouterStatus {
+    has_api_key: bool,
+}
+
 #[tauri::command]
 async fn bootstrap(state: State<'_, AppState>) -> IpcResult<Bootstrap> {
     let store = Arc::clone(&state.store);
     let (books, preferences) = tauri::async_runtime::spawn_blocking(move || {
         let store = store.lock().map_err(|e| e.to_string())?;
-        Ok::<_, String>((
-            store.books().map_err(|e| e.to_string())?,
-            store.preferences().map_err(|e| e.to_string())?,
-        ))
+        let mut preferences = store.preferences().map_err(|e| e.to_string())?;
+        if migrate_provider(&mut preferences) {
+            store
+                .save_preferences(&preferences)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok::<_, String>((store.books().map_err(|e| e.to_string())?, preferences))
     })
     .await
     .map_err(|e| e.to_string())??;
-    let (voices, warnings) = match state.speech.voices().await {
+    let (voices, mut warnings) = match state.speech.voices().await {
         Ok(voices) => (voices, Vec::new()),
         Err(e) => (Vec::new(), vec![e.to_string()]),
+    };
+    let open_router = match openrouter_status().await {
+        Ok(status) => status,
+        Err(error) => {
+            warnings.push(error);
+            OpenRouterStatus { has_api_key: false }
+        }
     };
     Ok(Bootstrap {
         books,
         preferences,
         voices,
         warnings,
+        open_router,
     })
 }
 #[tauri::command]
@@ -125,7 +197,15 @@ fn save_preferences(
     state: State<'_, AppState>,
     preferences: Preferences,
 ) -> IpcResult<Preferences> {
-    with_store(&state, |s| s.save_preferences(&preferences))
+    with_store(&state, |store| {
+        let previous = store.preferences()?;
+        let mut preferences = preferences;
+        migrate_provider(&mut preferences);
+        if previous.open_router_model != preferences.open_router_model {
+            preferences.open_router_voice = None;
+        }
+        store.save_preferences(&preferences)
+    })
 }
 #[tauri::command]
 async fn import_legacy(state: State<'_, AppState>, path: String) -> IpcResult<usize> {
@@ -146,12 +226,85 @@ fn set_background(state: State<'_, AppState>, path: Option<String>) -> IpcResult
     with_store(&state, |s| s.background(path.as_deref()))
 }
 #[tauri::command]
+async fn list_openrouter_models(
+    state: State<'_, AppState>,
+    refresh: Option<bool>,
+) -> IpcResult<Vec<OpenRouterModel>> {
+    catalog(&state, refresh.unwrap_or(false), false)
+        .await
+        .map(|(models, _)| models)
+}
+#[tauri::command]
+async fn openrouter_status() -> IpcResult<OpenRouterStatus> {
+    tauri::async_runtime::spawn_blocking(|| {
+        credentials::read().map(|key| OpenRouterStatus {
+            has_api_key: key.is_some(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn set_openrouter_key(
+    state: State<'_, AppState>,
+    api_key: String,
+) -> IpcResult<OpenRouterStatus> {
+    let api_key = zeroize::Zeroizing::new(api_key);
+    credentials::validate_key(&api_key).map_err(str::to_owned)?;
+    let mut cache = state.openrouter_catalog.lock().await;
+    state.speech.stop().await;
+    tauri::async_runtime::spawn_blocking(move || credentials::write(&api_key))
+        .await
+        .map_err(|e| e.to_string())??;
+    *cache = None;
+    drop(cache);
+    Ok(OpenRouterStatus { has_api_key: true })
+}
+#[tauri::command]
+async fn delete_openrouter_key(state: State<'_, AppState>) -> IpcResult<OpenRouterStatus> {
+    let mut cache = state.openrouter_catalog.lock().await;
+    state.speech.stop().await;
+    tauri::async_runtime::spawn_blocking(credentials::delete)
+        .await
+        .map_err(|e| e.to_string())??;
+    *cache = None;
+    drop(cache);
+    Ok(OpenRouterStatus { has_api_key: false })
+}
+#[tauri::command]
 async fn synthesize(
     state: State<'_, AppState>,
     text: String,
     voice: Option<String>,
     speed: f32,
 ) -> IpcResult<SpeechAudio> {
+    if matches!(voice.as_deref(), Some("openrouter" | LEGACY_FISH_VOICE)) {
+        let generation = state.speech.cancellation_generation();
+        let preferences = with_store(&state, Store::preferences)?;
+        let model = preferences
+            .open_router_model
+            .as_deref()
+            .ok_or_else(|| "Выберите TTS-модель OpenRouter".to_owned())?;
+        let (models, key) = catalog(&state, false, true).await?;
+        if !models.iter().any(|candidate| candidate.id == model) {
+            return Err(
+                "Выбранная TTS-модель OpenRouter недоступна; обновите список моделей".into(),
+            );
+        }
+        let key = key.ok_or_else(|| "Добавьте ключ OpenRouter в настройках".to_owned())?;
+        return state
+            .speech
+            .synthesize_with_openrouter_if_current(
+                &text,
+                &key,
+                model,
+                preferences.open_router_voice.as_deref(),
+                speed,
+                generation,
+            )
+            .await
+            .map_err(|e| e.to_string());
+    }
     state
         .speech
         .synthesize(&text, voice.as_deref(), speed)
@@ -178,6 +331,7 @@ pub fn run() -> tauri::Result<()> {
             app.manage(AppState {
                 store: Arc::new(Mutex::new(store)),
                 speech,
+                openrouter_catalog: tokio::sync::Mutex::new(None),
             });
             Ok(())
         })
@@ -193,6 +347,10 @@ pub fn run() -> tauri::Result<()> {
             save_preferences,
             import_legacy,
             set_background,
+            list_openrouter_models,
+            openrouter_status,
+            set_openrouter_key,
+            delete_openrouter_key,
             synthesize,
             stop_speech
         ])
@@ -205,5 +363,28 @@ mod tests {
     fn embeds_index_html() {
         let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
         assert!(context.assets().get(&"/index.html".into()).is_some());
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+    #[test]
+    fn migrates_legacy_fish_selection_without_switching_existing_model() {
+        let mut prefs = Preferences {
+            voice: Some(LEGACY_FISH_VOICE.into()),
+            ..Preferences::default()
+        };
+        assert!(migrate_provider(&mut prefs));
+        assert_eq!(prefs.voice.as_deref(), Some("openrouter"));
+        assert_eq!(
+            prefs.open_router_model.as_deref(),
+            Some("fish-audio/s2.1-pro-free:free")
+        );
+        prefs.voice = Some(LEGACY_FISH_VOICE.into());
+        prefs.open_router_model = Some("other/model".into());
+        assert!(migrate_provider(&mut prefs));
+        assert_eq!(prefs.open_router_model.as_deref(), Some("other/model"));
+        assert!(!migrate_provider(&mut prefs));
     }
 }

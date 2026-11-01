@@ -532,7 +532,10 @@ input[type="checkbox"] {
   height: 20px;
 }
 select,
-input:not([type]) {
+input:not([type]),
+input[type="text"],
+input[type="search"],
+input[type="password"] {
   color: var(--fg);
   background: transparent;
   border: 1px solid var(--line);
@@ -575,4 +578,50 @@ select option {
   *::after {
     scroll-behavior: auto !important;
   }
+}
+
+.openrouter-settings small {
+  line-height: 1.45;
+}
+.key-status {
+  margin: 4px 0 0;
+  font-size: 14px;
+}
+.key-form {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.key-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+}
+.key-form label {
+  min-width: 250px;
+  flex: 1;
+}
+
+.model-search {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+.model-search label,
+.model-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+}
+.model-search label:first-child {
+  flex: 1;
+  min-width: 220px;
+}
+.model-field {
+  margin-top: 8px;
 }

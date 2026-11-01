@@ -5,7 +5,18 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useVirtualizer } from "@tanstack/vue-virtual";
 import type { ComponentPublicInstance } from "vue";
 import { pronunciation, speechChunks } from "./utils/speech";
-import { replayIndex, runPlayback, synthesizeThenPlay } from "./utils/playback";
+import { preferencesSnapshot } from "./utils/preferences";
+import {
+  filterModels,
+  selectionForModel,
+  type ModelFilter,
+} from "./utils/openrouter";
+import {
+  configurePlaybackRate,
+  replayIndex,
+  runPlayback,
+  synthesizeThenPlay,
+} from "./utils/playback";
 import {
   LibraryBig,
   BookOpen,
@@ -32,6 +43,8 @@ import type {
   Mark,
   Preferences,
   SpeechAudio,
+  OpenRouterStatus,
+  OpenRouterModel,
   Voice,
 } from "./types/models";
 
@@ -48,6 +61,8 @@ const defaults: Preferences = {
   backgroundBlur: 0.4,
   surfaceTransparency: 0.18,
   voice: null,
+  openRouterModel: null,
+  openRouterVoice: null,
   dictionary: {},
 };
 const page = ref<Page>("library");
@@ -69,6 +84,27 @@ const dictionaryWord = ref("");
 const dictionaryValue = ref("");
 const reader = ref<HTMLElement | null>(null);
 const native = ref(false);
+const openRouter = ref<OpenRouterStatus>({ hasApiKey: false });
+const apiKeyDraft = ref("");
+const apiKeyBusy = ref(false);
+const models = ref<OpenRouterModel[]>([]);
+const modelsLoading = ref(false);
+const modelSaving = ref(false);
+const modelsLoaded = ref(false);
+const modelsError = ref("");
+const modelQuery = ref("");
+const modelFilter = ref<ModelFilter>("all");
+const filteredModels = computed(() =>
+  filterModels(models.value, modelQuery.value, modelFilter.value),
+);
+const selectedModel = computed(() =>
+  models.value.find((model) => model.id === prefs.value.openRouterModel),
+);
+const selectedInFilter = computed(() =>
+  filteredModels.value.some(
+    (model) => model.id === prefs.value.openRouterModel,
+  ),
+);
 let generation = 0;
 let audio: HTMLAudioElement | null = null;
 let audioCancel: (() => void) | null = null;
@@ -80,6 +116,8 @@ let speechStop = Promise.resolve();
 let followingUntil = 0;
 let userScrollUntil = 0;
 let openGeneration = 0;
+let pendingModelRefresh = false;
+let modelCatalogEpoch = 0;
 const virtualizer = useVirtualizer(
   computed(() => ({
     count: (book.value?.passages.length ?? 0) + 1,
@@ -172,18 +210,17 @@ function savePosition() {
 function savePrefsNow() {
   clearTimeout(preferencesTimer);
   if (!native.value) return preferenceQueue;
-  const snapshot = JSON.parse(JSON.stringify(prefs.value)) as Preferences;
-  preferenceQueue = preferenceQueue
-    .then(async () => {
-      await invoke("save_preferences", { preferences: snapshot });
-    })
-    .catch(report);
-  return preferenceQueue;
+  const snapshot = preferencesSnapshot(prefs.value);
+  const request = preferenceQueue.then(async () => {
+    await invoke("save_preferences", { preferences: snapshot });
+  });
+  preferenceQueue = request.catch(report);
+  return request;
 }
 function savePrefs() {
   clearTimeout(preferencesTimer);
   preferencesTimer = setTimeout(() => {
-    void savePrefsNow();
+    void savePrefsNow().catch(() => {});
   }, 250);
 }
 function stop() {
@@ -309,6 +346,7 @@ async function speakChunk(text: string, speed: number, token: number) {
     (result) =>
       new Promise<void>((resolve, reject) => {
         const player = new Audio(`data:${result.mime};base64,${result.data}`);
+        configurePlaybackRate(player, result.playbackRate);
         audio = player;
         audioCancel = resolve;
         player.onended = () => {
@@ -334,7 +372,11 @@ async function speak(text: string, speed: number, token: number) {
 }
 async function play() {
   const b = book.value;
-  if (!native.value || !b) return;
+  if (!native.value || !b || apiKeyBusy.value || modelSaving.value) return;
+  if (prefs.value.voice === "openrouter" && !openRouter.value.hasApiKey) {
+    notice.value = "Добавьте ключ OpenRouter в настройках";
+    return;
+  }
   if (completed.value && !b.passages.length) {
     let chapter = b.chapters.length - 1;
     while (chapter >= 0 && !b.chapters[chapter]?.text.trim()) chapter--;
@@ -355,6 +397,8 @@ async function play() {
   playing.value = true;
   notice.value = "";
   try {
+    await savePrefsNow();
+    if (token !== generation) return;
     await runPlayback({
       isCurrent: () => token === generation,
       current: () => {
@@ -430,9 +474,16 @@ async function play() {
   }
 }
 async function previewVoice() {
+  if (apiKeyBusy.value || modelSaving.value) return;
   stop();
   const token = generation;
+  if (prefs.value.voice === "openrouter" && !openRouter.value.hasApiKey) {
+    notice.value = "Добавьте ключ OpenRouter в настройках";
+    return;
+  }
   try {
+    await savePrefsNow();
+    if (token !== generation) return;
     await speak("Здравствуйте! Так звучит выбранный голос.", 1, token);
   } catch (e) {
     if (token === generation) report(e);
@@ -452,6 +503,8 @@ async function navigate(target: Page) {
   page.value = target;
   if (target === "reader") await jump();
   if (target === "marks") await loadMarks();
+  if (target === "settings" && !modelsLoaded.value && !modelsLoading.value)
+    void loadModels();
 }
 async function importBooks() {
   if (!native.value) return;
@@ -550,6 +603,7 @@ async function importLegacy() {
     books.value = state.books;
     prefs.value = state.preferences;
     voices.value = state.voices;
+    openRouter.value = state.openRouter;
     notice.value = `Импортировано книг: ${count}`;
   } catch (e) {
     report(e);
@@ -564,9 +618,129 @@ function addDictionary() {
   dictionaryValue.value = "";
   savePrefs();
 }
+async function refreshOpenRouter() {
+  const state = await invoke<Bootstrap>("bootstrap");
+  voices.value = state.voices;
+  openRouter.value = state.openRouter;
+}
+async function saveApiKey() {
+  const apiKey = apiKeyDraft.value.trim();
+  if (!apiKey || apiKeyBusy.value) return;
+  stop();
+  apiKeyBusy.value = true;
+  try {
+    await speechStop;
+    openRouter.value = await invoke<OpenRouterStatus>("set_openrouter_key", {
+      apiKey,
+    });
+    apiKeyDraft.value = "";
+    invalidateModelCatalog();
+    notice.value = "Ключ OpenRouter сохранён";
+    try {
+      await refreshOpenRouter();
+      await loadModels(true);
+    } catch {
+      notice.value = "Ключ сохранён, но список голосов не обновлён";
+    }
+  } catch (e) {
+    report(e);
+  } finally {
+    apiKeyBusy.value = false;
+  }
+}
+async function deleteApiKey() {
+  if (apiKeyBusy.value) return;
+  stop();
+  apiKeyBusy.value = true;
+  try {
+    await speechStop;
+    openRouter.value = await invoke<OpenRouterStatus>("delete_openrouter_key");
+    apiKeyDraft.value = "";
+    invalidateModelCatalog();
+    notice.value = "Ключ OpenRouter удалён";
+    try {
+      await refreshOpenRouter();
+      await loadModels(true);
+    } catch {
+      notice.value = "Ключ удалён, но список голосов не обновлён";
+    }
+  } catch (e) {
+    report(e);
+  } finally {
+    apiKeyBusy.value = false;
+  }
+}
+function invalidateModelCatalog() {
+  modelCatalogEpoch++;
+  models.value = [];
+  modelsLoaded.value = false;
+  modelsError.value = "";
+}
+async function loadModels(refresh = false) {
+  if (!native.value) return;
+  if (modelsLoading.value) {
+    if (refresh) pendingModelRefresh = true;
+    return;
+  }
+  modelsLoading.value = true;
+  modelsError.value = "";
+  const epoch = modelCatalogEpoch;
+  try {
+    const result = await invoke<OpenRouterModel[]>("list_openrouter_models", {
+      refresh,
+    });
+    if (epoch === modelCatalogEpoch) {
+      models.value = result;
+      modelsLoaded.value = true;
+    }
+  } catch (e) {
+    if (epoch === modelCatalogEpoch) modelsError.value = String(e);
+  } finally {
+    modelsLoading.value = false;
+    if (pendingModelRefresh) {
+      pendingModelRefresh = false;
+      void loadModels(true);
+    }
+  }
+}
+async function changeModel(event: Event) {
+  const id = (event.target as HTMLSelectElement).value;
+  if (id === prefs.value.openRouterModel || modelSaving.value) return;
+  const model = models.value.find((item) => item.id === id);
+  if (id && !model) return;
+  stop();
+  modelSaving.value = true;
+  const selection = selectionForModel(model);
+  prefs.value.openRouterModel = selection.model;
+  prefs.value.openRouterVoice = null;
+  if (selection.model) prefs.value.voice = "openrouter";
+  try {
+    await savePrefsNow();
+    if (selection.voice) {
+      prefs.value.openRouterVoice = selection.voice;
+      await savePrefsNow();
+    }
+  } catch (e) {
+    report(e);
+  } finally {
+    modelSaving.value = false;
+  }
+}
+function changeOpenRouterVoice(event: Event) {
+  stop();
+  const value = (event.target as HTMLInputElement).value.trim();
+  prefs.value.openRouterVoice = value || null;
+  savePrefs();
+}
 function changeVoice() {
   stop();
   savePrefs();
+  if (
+    prefs.value.voice === "openrouter" &&
+    !modelsLoaded.value &&
+    !modelsLoading.value
+  )
+    void loadModels();
 }
 function changeSpeed(event: Event) {
   if (!book.value) return;
@@ -590,13 +764,18 @@ onMounted(async () => {
       await getCurrentWindow().onCloseRequested(async (event) => {
         event.preventDefault();
         stop();
-        await Promise.all([savePositionNow(), savePrefsNow(), speechStop]);
-        await getCurrentWindow().destroy();
+        try {
+          await Promise.all([savePositionNow(), savePrefsNow(), speechStop]);
+          await getCurrentWindow().destroy();
+        } catch (e) {
+          report(e);
+        }
       });
       const state = await invoke<Bootstrap>("bootstrap");
       books.value = state.books;
       prefs.value = state.preferences;
       voices.value = state.voices;
+      openRouter.value = state.openRouter;
       notice.value = state.warnings.join("\n");
     } catch (e) {
       report(e);
@@ -606,7 +785,7 @@ onMounted(async () => {
 });
 onBeforeUnmount(() => {
   stop();
-  void savePrefsNow();
+  void savePrefsNow().catch(() => {});
 });
 </script>
 <template>
@@ -1012,8 +1191,173 @@ onBeforeUnmount(() => {
             step="0.05"
             @input="savePrefs"
         /></label>
+        <hr />
+        <div class="setting openrouter-settings">
+          <strong>OpenRouter</strong>
+          <small
+            >Нужен собственный ключ OpenRouter. Доступность и лимиты зависят от
+            выбранной модели.</small
+          >
+          <small
+            >Текст передаётся OpenRouter и провайдеру выбранной модели. Платная
+            модель автоматически не выбирается.</small
+          >
+          <small>Создать ключ: openrouter.ai/settings/keys</small>
+          <p class="key-status" role="status">
+            {{ openRouter.hasApiKey ? "Ключ сохранён" : "Ключ не добавлен" }}
+          </p>
+          <form class="key-form" @submit.prevent="saveApiKey">
+            <label
+              >Ключ API OpenRouter<input
+                v-model="apiKeyDraft"
+                type="password"
+                autocomplete="off"
+                spellcheck="false"
+                :disabled="!native || apiKeyBusy"
+            /></label>
+            <button
+              class="tonal"
+              type="submit"
+              :disabled="!native || apiKeyBusy || !apiKeyDraft.trim()"
+            >
+              Сохранить ключ
+            </button>
+            <button
+              class="text-button"
+              type="button"
+              :disabled="!native || apiKeyBusy || !openRouter.hasApiKey"
+              @click="deleteApiKey"
+            >
+              Удалить ключ
+            </button>
+          </form>
+          <div class="model-search">
+            <label
+              >Поиск модели<input
+                v-model="modelQuery"
+                type="search"
+                placeholder="Название или ID"
+                :disabled="!native"
+            /></label>
+            <label
+              >Стоимость<select v-model="modelFilter" :disabled="!native">
+                <option value="all">Все</option>
+                <option value="free">Бесплатные</option>
+                <option value="paid">Платные</option>
+              </select></label
+            >
+            <button
+              class="tonal"
+              type="button"
+              :disabled="!native || modelsLoading"
+              @click="loadModels(true)"
+            >
+              {{ modelsLoading ? "Загрузка…" : "Обновить каталог" }}
+            </button>
+          </div>
+          <small v-if="modelsLoading" role="status"
+            >Загрузка каталога моделей…</small
+          >
+          <small v-else-if="modelsError" role="alert"
+            >Не удалось загрузить каталог: {{ modelsError }}. Нажмите «Обновить
+            каталог», чтобы повторить.</small
+          >
+          <small v-else-if="modelsLoaded"
+            >Моделей: {{ models.length }} · показано:
+            {{ filteredModels.length }}</small
+          >
+          <label class="model-field"
+            >Модель OpenRouter
+            <select
+              :value="prefs.openRouterModel ?? ''"
+              :disabled="!native || modelSaving"
+              @change="changeModel"
+            >
+              <option value="">Выберите модель</option>
+              <option
+                v-if="prefs.openRouterModel && !selectedInFilter"
+                :value="prefs.openRouterModel"
+              >
+                {{ selectedModel?.name ?? prefs.openRouterModel
+                }}{{ selectedModel ? " · текущая" : " · нет в каталоге" }}
+              </option>
+              <option
+                v-for="model in filteredModels"
+                :key="model.id"
+                :value="model.id"
+              >
+                {{ model.name }} · {{ model.free ? "бесплатно" : "платно" }}
+              </option>
+            </select>
+          </label>
+          <small v-if="selectedModel"
+            >{{ selectedModel.id }} ·
+            {{ selectedModel.free ? "бесплатно" : "платно" }}</small
+          >
+          <small
+            v-if="
+              selectedModel &&
+              (selectedModel.pricing.prompt || selectedModel.pricing.completion)
+            "
+            >Тариф API, USD: вход
+            {{ selectedModel.pricing.prompt || "не указан" }} · выход
+            {{ selectedModel.pricing.completion || "не указан" }}. Единицы
+            тарификации зависят от модели.</small
+          >
+          <small
+            v-if="
+              prefs.openRouterModel &&
+              modelsLoaded &&
+              !modelsLoading &&
+              !modelsError &&
+              !selectedModel
+            "
+            >Сохранённая модель отсутствует в текущем каталоге. Выбор
+            сохранён.</small
+          >
+          <label v-if="selectedModel?.voices.length" class="model-field"
+            >Голос модели
+            <select
+              :value="prefs.openRouterVoice ?? ''"
+              :disabled="!native || modelSaving"
+              @change="changeOpenRouterVoice"
+            >
+              <option value="">По умолчанию</option>
+              <option
+                v-if="
+                  prefs.openRouterVoice &&
+                  !selectedModel.voices.includes(prefs.openRouterVoice)
+                "
+                :value="prefs.openRouterVoice"
+              >
+                {{ prefs.openRouterVoice }} · сохранённый
+              </option>
+              <option
+                v-for="voice in selectedModel.voices"
+                :key="voice"
+                :value="voice"
+              >
+                {{ voice }}
+              </option>
+            </select>
+          </label>
+          <label v-else-if="prefs.openRouterModel" class="model-field"
+            >ID голоса модели (необязательно)<input
+              type="text"
+              :value="prefs.openRouterVoice ?? ''"
+              autocomplete="off"
+              spellcheck="false"
+              :disabled="!native || modelSaving"
+              @input="changeOpenRouterVoice"
+          /></label>
+          <small
+            >Без ID используется голос модели по умолчанию. Выберите OpenRouter
+            в общем списке голосов ниже.</small
+          >
+        </div>
+        <hr />
         <label class="setting"
-          >Голос<select
+          >Движок и голос<select
             v-model="prefs.voice"
             :disabled="!native"
             @change="changeVoice"
@@ -1030,7 +1374,7 @@ onBeforeUnmount(() => {
             ><small>Проверить выбранный голос</small></span
           ><button
             class="icon"
-            :disabled="!native"
+            :disabled="!native || apiKeyBusy || modelSaving"
             aria-label="Прослушать голос"
             @click="previewVoice"
           >

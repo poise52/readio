@@ -31,3 +31,11 @@ export async function synthesizeThenPlay<T>(
   const audio = await synthesize();
   if (isCurrent()) await play(audio);
 }
+
+export function configurePlaybackRate(
+  audio: { playbackRate: number; preservesPitch: boolean },
+  requestedRate?: number,
+): void {
+  audio.playbackRate = requestedRate ?? 1;
+  audio.preservesPitch = true;
+}

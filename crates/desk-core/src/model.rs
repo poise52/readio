@@ -174,6 +174,8 @@ pub struct Preferences {
     pub background_blur: f64,
     pub surface_transparency: f64,
     pub voice: Option<String>,
+    pub open_router_model: Option<String>,
+    pub open_router_voice: Option<String>,
     pub dictionary: BTreeMap<String, String>,
 }
 impl Default for Preferences {
@@ -190,6 +192,8 @@ impl Default for Preferences {
             background_blur: 0.4,
             surface_transparency: 0.18,
             voice: None,
+            open_router_model: None,
+            open_router_voice: None,
             dictionary: BTreeMap::new(),
         }
     }
@@ -197,6 +201,18 @@ impl Default for Preferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_preferences_default_openrouter_voice() -> Result<(), serde_json::Error> {
+        let prefs: Preferences = serde_json::from_str(r#"{"dark":false}"#)?;
+        assert_eq!(prefs.open_router_model, None);
+        assert_eq!(prefs.open_router_voice, None);
+        assert!(
+            serde_json::to_value(prefs)?
+                .get("openRouterVoice")
+                .is_some()
+        );
+        Ok(())
+    }
     #[test]
     fn utf16_offsets_include_surrogate_pairs() {
         let passages = split_passages("  😀 Привет!  Мир.\nДа");

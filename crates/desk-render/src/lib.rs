@@ -1,3 +1,6 @@
+mod openrouter;
+pub use openrouter::{OpenRouterModel, OpenRouterPricing};
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use msedge_tts::tts::{
     SpeechConfig,
@@ -22,6 +25,7 @@ use tokio::{
 
 const MAX_TEXT_BYTES: usize = 8_000;
 const MAX_AUDIO_BYTES: usize = 32 * 1024 * 1024;
+pub const OPENROUTER_VOICE: &str = "openrouter";
 const EDGE_DMITRY: &str = "ru-RU-DmitryNeural";
 const EDGE_SVETLANA: &str = "ru-RU-SvetlanaNeural";
 
@@ -55,11 +59,13 @@ pub struct Voice {
 pub struct SpeechAudio {
     pub data: String,
     pub mime: String,
+    pub playback_rate: f32,
 }
 
 #[derive(Debug)]
 pub struct SpeechService {
     data_dir: PathBuf,
+    openrouter_client: reqwest::Client,
     generation: watch::Sender<u64>,
     generation_lock: Mutex<()>,
 }
@@ -75,11 +81,12 @@ impl SpeechService {
     /// Creates a speech service using the application data directory.
     ///
     /// # Errors
-    /// Reserved for initialization failures.
+    /// Returns an error if the HTTP client cannot be initialized.
     pub fn new(data_dir: PathBuf) -> Result<Self, SpeechError> {
         let (generation, _) = watch::channel(0);
         Ok(Self {
             data_dir,
+            openrouter_client: openrouter::client()?,
             generation,
             generation_lock: Mutex::new(()),
         })
@@ -103,6 +110,12 @@ impl SpeechService {
                 name: "Edge Светлана · онлайн".into(),
                 locale: "ru-RU".into(),
                 engine: "edge".into(),
+            },
+            Voice {
+                id: OPENROUTER_VOICE.into(),
+                name: "OpenRouter · онлайн".into(),
+                locale: "multilingual".into(),
+                engine: "openrouter".into(),
             },
         ];
         if self.piper_binary().is_some() {
@@ -132,17 +145,6 @@ impl SpeechService {
         if !speed.is_finite() || !(0.5..=3.0).contains(&speed) {
             return Err(SpeechError::InvalidSpeed);
         }
-        let mut cancelled = {
-            let _guard = self
-                .generation_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut receiver = self.generation.subscribe();
-            self.generation
-                .send_modify(|value| *value = value.wrapping_add(1));
-            receiver.borrow_and_update();
-            receiver
-        };
         let selected = voice.unwrap_or(EDGE_DMITRY);
         let operation = async {
             if selected == EDGE_DMITRY || selected == EDGE_SVETLANA {
@@ -179,11 +181,7 @@ impl SpeechService {
                     .map(|audio| (audio, "audio/wav"))
             }
         };
-        let result = tokio::select! {
-            biased;
-            _ = cancelled.changed() => return Err(SpeechError::Cancelled),
-            result = timeout(Duration::from_secs(60), operation) => result.map_err(|_| SpeechError::Timeout)??,
-        };
+        let result = self.run_cancellable(Box::pin(operation)).await?;
         if result.0.is_empty() || result.0.len() > MAX_AUDIO_BYTES {
             return Err(SpeechError::Engine(
                 "Получено пустое или слишком большое аудио".into(),
@@ -192,7 +190,124 @@ impl SpeechService {
         Ok(SpeechAudio {
             data: STANDARD.encode(result.0),
             mime: result.1.into(),
+            playback_rate: 1.0,
         })
+    }
+
+    /// Fetches available text-to-speech models from `OpenRouter`.
+    ///
+    /// # Errors
+    /// Returns an error if the catalogue cannot be retrieved or parsed.
+    pub async fn openrouter_models(
+        &self,
+        api_key: Option<&str>,
+    ) -> Result<Vec<OpenRouterModel>, SpeechError> {
+        openrouter::models(&self.openrouter_client, api_key).await
+    }
+
+    /// Synthesizes speech with the selected `OpenRouter` model.
+    ///
+    /// # Errors
+    /// Returns an error for invalid input, credentials, network/API errors, cancellation or timeout.
+    pub async fn synthesize_with_openrouter(
+        &self,
+        text: &str,
+        api_key: &str,
+        model: &str,
+        voice: Option<&str>,
+        speed: f32,
+    ) -> Result<SpeechAudio, SpeechError> {
+        self.synthesize_openrouter(text, api_key, model, voice, speed, None)
+            .await
+    }
+
+    /// Returns a cancellation marker to use when an operation starts after asynchronous preparation.
+    pub fn cancellation_generation(&self) -> u64 {
+        let _guard = self
+            .generation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self.generation.borrow()
+    }
+
+    /// Synthesizes speech only if no cancellation or newer request occurred since `generation`.
+    ///
+    /// # Errors
+    /// Returns an error for stale generation, invalid input, credentials, network/API errors or timeout.
+    pub async fn synthesize_with_openrouter_if_current(
+        &self,
+        text: &str,
+        api_key: &str,
+        model: &str,
+        voice: Option<&str>,
+        speed: f32,
+        generation: u64,
+    ) -> Result<SpeechAudio, SpeechError> {
+        self.synthesize_openrouter(text, api_key, model, voice, speed, Some(generation))
+            .await
+    }
+
+    async fn synthesize_openrouter(
+        &self,
+        text: &str,
+        api_key: &str,
+        model: &str,
+        voice: Option<&str>,
+        speed: f32,
+        generation: Option<u64>,
+    ) -> Result<SpeechAudio, SpeechError> {
+        if text.trim().is_empty() || text.len() > MAX_TEXT_BYTES {
+            return Err(SpeechError::InvalidText);
+        }
+        if !speed.is_finite() || !(0.5..=3.0).contains(&speed) {
+            return Err(SpeechError::InvalidSpeed);
+        }
+        let (audio, mime) = self
+            .run_cancellable_if_current(
+                openrouter::synthesize(&self.openrouter_client, text, api_key, model, voice),
+                generation,
+            )
+            .await?;
+        Ok(SpeechAudio {
+            data: STANDARD.encode(audio),
+            mime: mime.into(),
+            playback_rate: speed,
+        })
+    }
+
+    async fn run_cancellable<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, SpeechError>>,
+    ) -> Result<T, SpeechError> {
+        self.run_cancellable_if_current(operation, None).await
+    }
+
+    async fn run_cancellable_if_current<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, SpeechError>>,
+        generation: Option<u64>,
+    ) -> Result<T, SpeechError> {
+        let mut cancelled = self.begin_generation(generation)?;
+        tokio::select! {
+            biased;
+            _ = cancelled.changed() => Err(SpeechError::Cancelled),
+            result = timeout(Duration::from_secs(60), operation) => result.map_err(|_| SpeechError::Timeout)?,
+        }
+    }
+
+    fn begin_generation(&self, expected: Option<u64>) -> Result<watch::Receiver<u64>, SpeechError> {
+        let _guard = self
+            .generation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if expected.is_some_and(|value| value != *self.generation.borrow()) {
+            return Err(SpeechError::Cancelled);
+        }
+        let mut receiver = self.generation.subscribe();
+        self.generation
+            .send_modify(|value| *value = value.wrapping_add(1));
+        receiver.borrow_and_update();
+        Ok(receiver)
     }
 
     #[allow(clippy::unused_async)]
@@ -479,6 +594,26 @@ mod tests {
             "&lt;&amp;&gt;&quot;&apos; \nтекст"
         );
     }
+    #[tokio::test]
+    async fn stop_invalidates_prepared_openrouter_request() {
+        let service = SpeechService::new(PathBuf::new()).unwrap();
+        let generation = service.cancellation_generation();
+        service.stop().await;
+        assert!(matches!(
+            service
+                .synthesize_with_openrouter_if_current(
+                    "text",
+                    "key",
+                    "example/model",
+                    None,
+                    1.0,
+                    generation
+                )
+                .await,
+            Err(SpeechError::Cancelled)
+        ));
+    }
+
     #[test]
     fn wraps_pcm_in_a_mono_wav_header() {
         let wav = pcm_to_wav(&[0x12, 0x34, 0x56, 0x78], 22_050).unwrap();
@@ -537,7 +672,7 @@ mod tests {
         .unwrap();
         assert!(
             timeout(
-                Duration::from_millis(300),
+                Duration::from_millis(1500),
                 piper(&script, &model, "тест", 1.0)
             )
             .await

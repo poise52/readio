@@ -19,6 +19,11 @@ readio-speech = { path = "../desk-render", version = "0.1.0" }
 serde.workspace = true
 tauri.workspace = true
 tauri-plugin-dialog.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+keyring.workspace = true
 
 [lints]
 workspace = true

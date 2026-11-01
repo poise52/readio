@@ -33,3 +33,12 @@ test('pause during synthesis discards late audio before playback starts', async 
   await playing
   assert.equal(played, false)
 })
+
+test('Remote audio speed is applied locally with pitch preservation', async () => {
+  const { configurePlaybackRate } = await import('../app/utils/playback.ts')
+  const audio = { playbackRate: 1, preservesPitch: false }
+  configurePlaybackRate(audio, 1.7)
+  assert.deepEqual(audio, { playbackRate: 1.7, preservesPitch: true })
+  configurePlaybackRate(audio)
+  assert.equal(audio.playbackRate, 1)
+})

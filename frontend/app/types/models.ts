@@ -40,6 +40,8 @@ export interface Preferences {
   backgroundBlur: number;
   surfaceTransparency: number;
   voice: string | null;
+  openRouterModel: string | null;
+  openRouterVoice: string | null;
   dictionary: Record<string, string>;
 }
 export interface Voice {
@@ -48,13 +50,26 @@ export interface Voice {
   locale: string;
   engine: string;
 }
+export interface OpenRouterModel {
+  id: string;
+  name: string;
+  description: string;
+  pricing: { prompt: string; completion: string };
+  voices: string[];
+  free: boolean;
+}
+export interface OpenRouterStatus {
+  hasApiKey: boolean;
+}
 export interface Bootstrap {
   books: BookSummary[];
   preferences: Preferences;
   voices: Voice[];
   warnings: string[];
+  openRouter: OpenRouterStatus;
 }
 export interface SpeechAudio {
   data: string;
   mime: string;
+  playbackRate?: number;
 }
