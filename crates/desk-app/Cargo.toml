@@ -1,0 +1,24 @@
+[package]
+name = "readio-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lib]
+name = "readio_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+desk-core = { path = "../desk-core", version = "0.1.0" }
+readio-speech = { path = "../desk-render", version = "0.1.0" }
+serde.workspace = true
+tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+
+[lints]
+workspace = true

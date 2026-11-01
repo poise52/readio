@@ -1,0 +1,25 @@
+//! TTS Stream module
+
+use crate::tts::{AudioMetadata, Payload};
+
+/// Synthesized Stream Response
+#[derive(Debug)]
+pub enum SynthesizedResponse {
+    /// Synthesized Audio bytes segment
+    AudioBytes(Vec<u8>),
+    /// Synthesized Audio Metadata segment
+    AudioMetadata(Vec<AudioMetadata>),
+}
+
+impl From<Payload> for SynthesizedResponse {
+    fn from(payload: Payload) -> Self {
+        match payload {
+            Payload::AudioBytes((bytes, index)) => {
+                SynthesizedResponse::AudioBytes(bytes[index..].to_vec())
+            }
+            Payload::AudioMetadata(metadata) => SynthesizedResponse::AudioMetadata(metadata),
+        }
+    }
+}
+
+pub mod tokio_runtime;

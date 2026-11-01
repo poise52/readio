@@ -1,0 +1,23 @@
+[package]
+name = "desk-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+encoding_rs.workspace = true
+percent-encoding.workspace = true
+regex.workspace = true
+roxmltree.workspace = true
+rusqlite.workspace = true
+scraper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true
