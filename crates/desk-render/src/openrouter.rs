@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use reqwest::{
     Client, StatusCode,
@@ -19,6 +19,8 @@ const MAX_CATALOG_BYTES: usize = 8 * 1024 * 1024;
 pub struct OpenRouterPricing {
     pub prompt: String,
     pub completion: String,
+    #[serde(flatten)]
+    pub other: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,11 +152,22 @@ fn parse_catalog(bytes: &[u8]) -> Result<Vec<OpenRouterModel>, SpeechError> {
                     .filter_map(|value| value.as_str().map(str::to_owned))
                     .collect()
             });
+        let other = pricing.map_or_else(BTreeMap::new, |prices| {
+            prices
+                .iter()
+                .filter(|(name, _)| name.as_str() != "prompt" && name.as_str() != "completion")
+                .map(|(name, value)| (name.clone(), value.as_str().unwrap_or("unknown").to_owned()))
+                .collect()
+        });
         models.push(OpenRouterModel {
             id: id.into(),
             name: entry["name"].as_str().unwrap_or(id).into(),
             description: entry["description"].as_str().unwrap_or("").into(),
-            pricing: OpenRouterPricing { prompt, completion },
+            pricing: OpenRouterPricing {
+                prompt,
+                completion,
+                other,
+            },
             voices,
             free,
         });
@@ -162,14 +175,19 @@ fn parse_catalog(bytes: &[u8]) -> Result<Vec<OpenRouterModel>, SpeechError> {
     Ok(models)
 }
 
-pub async fn synthesize(
+pub async fn synthesize<F, Fut>(
     client: &Client,
     text: &str,
     api_key: &str,
     model: &str,
     voice: Option<&str>,
-) -> Result<(Vec<u8>, &'static str), SpeechError> {
-    send(
+    on_response: F,
+) -> Result<(Vec<u8>, &'static str), SpeechError>
+where
+    F: FnOnce(Option<String>) -> Fut + Send,
+    Fut: Future<Output = Result<(), SpeechError>> + Send,
+{
+    send_tracked(
         client,
         ENDPOINT,
         text,
@@ -177,32 +195,16 @@ pub async fn synthesize(
         model,
         voice,
         MAX_AUDIO_BYTES,
+        on_response,
     )
     .await
 }
 
-fn pcm_only(model: &str) -> bool {
-    model.starts_with("heygen/") || (model.starts_with("google/gemini-") && model.contains("tts"))
-}
-fn pcm_default_rate(model: &str) -> Option<u32> {
-    if model.starts_with("heygen/") {
-        Some(44_100)
-    } else if model.starts_with("google/gemini-") && model.contains("tts") {
-        Some(24_000)
-    } else {
-        None
-    }
-}
-
-async fn send(
-    client: &Client,
-    endpoint: &str,
-    text: &str,
+pub fn validate_request(
     api_key: &str,
     model: &str,
     voice: Option<&str>,
-    audio_limit: usize,
-) -> Result<(Vec<u8>, &'static str), SpeechError> {
+) -> Result<HeaderValue, SpeechError> {
     if model.is_empty() || model.len() > 256 || model.chars().any(char::is_whitespace) {
         return Err(SpeechError::Engine("Выберите модель OpenRouter".into()));
     }
@@ -213,7 +215,69 @@ async fn send(
             "Некорректный идентификатор голоса OpenRouter".into(),
         ));
     }
-    let auth = authorization(api_key)?;
+    authorization(api_key)
+}
+
+fn pcm_only(model: &str) -> bool {
+    model.starts_with("heygen/") || (model.starts_with("google/gemini-") && model.contains("tts"))
+}
+fn pcm_default_rate(model: &str) -> Option<u32> {
+    if model.starts_with("heygen/heygen-voice-1") {
+        Some(44_100)
+    } else if [
+        "google/gemini-2.5-",
+        "google/gemini-3.1-",
+        "google/gemini-3.8-",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
+        && model.contains("tts")
+    {
+        Some(24_000)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+async fn send(
+    client: &Client,
+    endpoint: &str,
+    text: &str,
+    api_key: &str,
+    model: &str,
+    voice: Option<&str>,
+    audio_limit: usize,
+) -> Result<(Vec<u8>, &'static str), SpeechError> {
+    send_tracked(
+        client,
+        endpoint,
+        text,
+        api_key,
+        model,
+        voice,
+        audio_limit,
+        |_| async { Ok(()) },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_tracked<F, Fut>(
+    client: &Client,
+    endpoint: &str,
+    text: &str,
+    api_key: &str,
+    model: &str,
+    voice: Option<&str>,
+    audio_limit: usize,
+    on_response: F,
+) -> Result<(Vec<u8>, &'static str), SpeechError>
+where
+    F: FnOnce(Option<String>) -> Fut + Send,
+    Fut: Future<Output = Result<(), SpeechError>> + Send,
+{
+    let auth = validate_request(api_key, model, voice)?;
     let response_format = if pcm_only(model) { "pcm" } else { "mp3" };
     let request = SpeechRequest {
         model,
@@ -237,6 +301,13 @@ async fn send(
                 )
             }
         })?;
+    let generation_id = response
+        .headers()
+        .get("x-generation-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| safe_generation_id(value) && *value != api_key)
+        .map(str::to_owned);
+    on_response(generation_id).await?;
     if !response.status().is_success() {
         return Err(status_error(
             response.status(),
@@ -260,31 +331,99 @@ async fn send(
             "OpenRouter вернул ответ без поддерживаемого аудио".into(),
         ));
     }
-    let rate = if is_pcm {
-        Some(pcm_rate(&content_type, model)?)
-    } else {
-        None
-    };
     let audio = bounded_body(response, audio_limit).await?;
+    decode_audio(audio, &content_type, model)
+}
+
+fn safe_generation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && !value.to_ascii_lowercase().starts_with("sk-")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn decode_audio(
+    audio: Vec<u8>,
+    content_type: &str,
+    model: &str,
+) -> Result<(Vec<u8>, &'static str), SpeechError> {
     if audio.is_empty() {
         return Err(SpeechError::Engine("OpenRouter вернул пустое аудио".into()));
     }
-    if let Some(rate) = rate {
-        if audio.len() % 2 != 0 {
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    if media_type.eq_ignore_ascii_case("audio/mpeg") {
+        return Ok((audio, "audio/mpeg"));
+    }
+    if audio.starts_with(b"RIFF") {
+        if valid_wav(&audio) {
+            return Ok((audio, "audio/wav"));
+        }
+        return Err(SpeechError::Engine(
+            "OpenRouter вернул повреждённый WAV".into(),
+        ));
+    }
+    if media_type.eq_ignore_ascii_case("audio/pcm") {
+        let rate = pcm_rate(content_type, model)?;
+        if !audio.len().is_multiple_of(2) {
             return Err(SpeechError::Engine(
                 "OpenRouter вернул повреждённое PCM-аудио".into(),
             ));
         }
-        Ok((crate::pcm_to_wav(&audio, rate)?, "audio/wav"))
-    } else if media_type.eq_ignore_ascii_case("audio/mpeg") {
-        Ok((audio, "audio/mpeg"))
-    } else if audio.starts_with(b"RIFF") {
-        Ok((audio, "audio/wav"))
-    } else {
-        Err(SpeechError::Engine(
-            "OpenRouter вернул повреждённый WAV".into(),
-        ))
+        return Ok((crate::pcm_to_wav(&audio, rate)?, "audio/wav"));
     }
+    Err(SpeechError::Engine(
+        "OpenRouter вернул повреждённый WAV".into(),
+    ))
+}
+
+fn valid_wav(data: &[u8]) -> bool {
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return false;
+    }
+    let length = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let Some(end) = length.checked_add(8) else {
+        return false;
+    };
+    if end > data.len() || end < 12 {
+        return false;
+    }
+    let mut cursor = 12;
+    let mut has_format = false;
+    let mut has_audio = false;
+    while cursor + 8 <= end {
+        let id = &data[cursor..cursor + 4];
+        let size = u32::from_le_bytes([
+            data[cursor + 4],
+            data[cursor + 5],
+            data[cursor + 6],
+            data[cursor + 7],
+        ]) as usize;
+        let Some(next) = cursor
+            .checked_add(8)
+            .and_then(|offset| offset.checked_add(size))
+        else {
+            return false;
+        };
+        if next > end {
+            return false;
+        }
+        if id == b"fmt " {
+            has_format = size >= 16;
+        }
+        if id == b"data" {
+            has_audio = size > 0;
+        }
+        let Some(padded) = next.checked_add(size & 1) else {
+            return false;
+        };
+        if padded > end {
+            return false;
+        }
+        cursor = padded;
+    }
+    cursor == end && has_format && has_audio
 }
 
 fn pcm_rate(content_type: &str, model: &str) -> Result<u32, SpeechError> {
@@ -460,6 +599,18 @@ mod tests {
     }
 
     #[test]
+    fn detects_wave_container_in_pcm_response() {
+        let wav = crate::pcm_to_wav(&[1, 2, 3, 4], 24_000).unwrap();
+        let (decoded, mime) =
+            decode_audio(wav.clone(), "audio/pcm", "google/gemini-3.8-flash-tts").unwrap();
+        assert_eq!(mime, "audio/wav");
+        assert_eq!(decoded, wav);
+        let mut truncated = wav;
+        truncated.pop();
+        assert!(decode_audio(truncated, "audio/pcm", "google/gemini-3.8-flash-tts").is_err());
+    }
+
+    #[test]
     fn pcm_metadata_accepts_only_known_mono_rates() {
         assert_eq!(
             pcm_rate("audio/pcm; rate=48000; channels=1", "unknown").unwrap(),
@@ -469,9 +620,42 @@ mod tests {
             pcm_rate("audio/pcm", "google/gemini-3.8-flash-tts").unwrap(),
             24_000
         );
-        assert_eq!(pcm_rate("audio/pcm", "heygen/voice").unwrap(), 44_100);
+        assert_eq!(
+            pcm_rate("audio/pcm", "heygen/heygen-voice-1").unwrap(),
+            44_100
+        );
         assert!(pcm_rate("audio/pcm", "unknown").is_err());
+        assert!(pcm_rate("audio/pcm", "google/gemini-9.0-tts").is_err());
+        assert!(pcm_rate("audio/pcm", "heygen/voice-9").is_err());
         assert!(pcm_rate("audio/pcm; rate=24000; channels=2", "unknown").is_err());
+    }
+
+    #[tokio::test]
+    async fn tracks_headers_before_truncated_body_and_error_status() {
+        use std::sync::{Arc, Mutex};
+        for reply in [
+            b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nX-Generation-Id: gen-test-123\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx".as_slice(),
+            b"HTTP/1.1 429 Too Many Requests\r\nX-Generation-Id: gen-test-123\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+        ] {
+            let (url, server_task) = server(reply).await;
+            let recorded = Arc::new(Mutex::new(None));
+            let target = Arc::clone(&recorded);
+            let result = send_tracked(&test_client(), &url, "text", "key", MODEL, None, 1024, move |id| async move {
+                *target.lock().unwrap() = id;
+                Ok(())
+            }).await;
+            assert!(result.is_err());
+            assert_eq!(recorded.lock().unwrap().as_deref(), Some("gen-test-123"));
+            server_task.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_generation_ids() {
+        assert!(safe_generation_id("gen-123_abc.def"));
+        assert!(!safe_generation_id("sk-or-v1-secret"));
+        assert!(!safe_generation_id("gen secret"));
+        assert!(!safe_generation_id(&"x".repeat(513)));
     }
 
     #[tokio::test]

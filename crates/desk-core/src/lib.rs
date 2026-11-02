@@ -1,10 +1,18 @@
+mod audio;
+mod generation;
 mod importer;
 mod model;
 mod store;
 
+pub use audio::{
+    AUDIO_BLOCK_MAX_ESCAPED_BYTES, AUDIO_BLOCK_MAX_PASSAGES, AudioBlock, AudioCache, AudioPart,
+    AudioProfile, CachedAudio, OfflineManifest, plan_book, plan_chapter,
+};
+pub use generation::{GenerationAttempt, GenerationJournal, GenerationPrepare, GenerationState};
 pub use importer::import_book;
 pub use model::{
-    Book, BookSummary, BookmarkEntry, Chapter, Mark, Passage, Preferences, split_passages,
+    BillingUnit, Book, BookSummary, BookmarkEntry, Chapter, Mark, Passage, Preferences,
+    split_passages,
 };
 pub use store::Store;
 

@@ -1,15 +1,12 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
-import { pronunciation, speechChunks } from '../app/utils/speech.ts'
+import { speechChunks } from '../app/utils/speech.ts'
 
-test('chunks preserve Unicode text and remain under synthesis byte limit', () => {
-  const source = '😀Привет, мир! '.repeat(2000)
+test('preview chunks preserve Unicode text and remain within escaped XML byte limit', () => {
+  const source = '😀Привет, <мир> & друзья! '.repeat(2000)
   const chunks = speechChunks(source)
+  const replacements: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }
   assert.equal(chunks.join(''), source)
   assert.ok(chunks.length > 1)
-  assert.ok(chunks.every(chunk => new TextEncoder().encode(chunk).length <= 7000))
-})
-
-test('dictionary matches whole words and replaces literal dollar signs', () => {
-  assert.equal(pronunciation('Кот, котик и КОТ.', { кот: '$1' }), '$1, котик и $1.')
+  assert.ok(chunks.every(chunk => new TextEncoder().encode(chunk.replace(/[&<>"']/g, char => replacements[char]!)).length <= 3500))
 })

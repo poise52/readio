@@ -2,10 +2,21 @@
 import { invoke, isTauri, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { useVirtualizer } from "@tanstack/vue-virtual";
 import type { ComponentPublicInstance } from "vue";
-import { pronunciation, speechChunks } from "./utils/speech";
-import { preferencesSnapshot } from "./utils/preferences";
+import { speechChunks } from "./utils/speech";
+import {
+  billingUnitDirty,
+  preferencesSnapshot,
+  withCurrentBillingUnits,
+} from "./utils/preferences";
+import { PreviewOwner } from "./utils/preview-owner";
+import {
+  shouldPollOffline,
+  shouldRefreshPausedQuote,
+  isStaleQuoteError,
+} from "./utils/offline-refresh";
 import {
   filterModels,
   selectionForModel,
@@ -13,10 +24,20 @@ import {
 } from "./utils/openrouter";
 import {
   configurePlaybackRate,
+  playbackRate,
   replayIndex,
-  runPlayback,
   synthesizeThenPlay,
 } from "./utils/playback";
+import {
+  AudioBlockLoader,
+  audioErrorCode,
+  audioErrorMessage,
+  PlaybackGate,
+  blockForOffset,
+  blockOffsetFraction,
+  blockPosition,
+} from "./utils/audio-cache";
+import { PlaybackInterest } from "./utils/playback-interest";
 import {
   LibraryBig,
   BookOpen,
@@ -31,8 +52,9 @@ import {
   Play,
   Pause,
   Square,
-  ChevronDown,
-  ChevronUp,
+  Volume2,
+  Download,
+  CloudOff,
   Image as ImageIcon,
   X,
 } from "lucide-vue-next";
@@ -46,6 +68,10 @@ import type {
   OpenRouterStatus,
   OpenRouterModel,
   Voice,
+  AudioBlock,
+  AudioPlan,
+  OfflineStatus,
+  OfflineQuote,
 } from "./types/models";
 
 type Page = "library" | "reader" | "marks" | "settings";
@@ -62,7 +88,9 @@ const defaults: Preferences = {
   surfaceTransparency: 0.18,
   voice: null,
   openRouterModel: null,
+  openRouterBillingUnits: {},
   openRouterVoice: null,
+  volume: 1,
   dictionary: {},
 };
 const page = ref<Page>("library");
@@ -75,8 +103,28 @@ const marks = ref<{ book: BookSummary; mark: Mark; chapterTitle: string }[]>(
 );
 const active = ref(0);
 const playing = ref(false);
+const paused = ref(false);
+const offlineStatuses = ref<Record<string, OfflineStatus>>({});
+const offlineSource = ref<Record<string, boolean>>({});
+const offlineDialog = ref(false);
+const offlineDialogElement = ref<HTMLElement | null>(null);
+const offlineCloseButton = ref<HTMLButtonElement | null>(null);
+let offlinePreviousFocus: HTMLElement | null = null;
+const offlineQuote = ref<OfflineQuote | null>(null);
+const offlineRetryConfirmed = ref(false);
+const offlineBusy = ref(false);
+const offlineError = ref("");
+const offlineInfo = ref("");
+const billingUnitDraft = ref<"" | "character" | "utf8_byte">("");
+const offlineBookId = ref("");
+const billingDirty = computed(() =>
+  billingUnitDirty(
+    offlineQuote.value?.model ?? null,
+    billingUnitDraft.value,
+    prefs.value.openRouterBillingUnits,
+  ),
+);
 const completed = ref(false);
-const compact = ref(false);
 const loading = ref(true);
 const notice = ref("");
 const chapterMenu = ref(false);
@@ -84,6 +132,9 @@ const dictionaryWord = ref("");
 const dictionaryValue = ref("");
 const reader = ref<HTMLElement | null>(null);
 const native = ref(false);
+const closing = ref(false);
+const shutdownError = ref("");
+const shutdownWarning = ref("");
 const openRouter = ref<OpenRouterStatus>({ hasApiKey: false });
 const apiKeyDraft = ref("");
 const apiKeyBusy = ref(false);
@@ -106,13 +157,109 @@ const selectedInFilter = computed(() =>
   ),
 );
 let generation = 0;
+let loopRunning = false;
+let currentAudioBlock: AudioBlock | null = null;
+const playbackGate = new PlaybackGate();
+let playbackInterest: PlaybackInterest | null = null;
+const retryPrompt = ref<{ message: string; attemptId: string } | null>(null);
+const retryDialog = ref<HTMLElement | null>(null);
+const retryCancelButton = ref<HTMLButtonElement | null>(null);
+let retryPreviousFocus: HTMLElement | null = null;
+let retryResolve: ((confirmed: boolean) => void) | null = null;
+function resolveRetry(confirmed: boolean) {
+  retryPrompt.value = null;
+  const resolve = retryResolve;
+  retryResolve = null;
+  if (resolve) retryPreviousFocus?.focus();
+  retryPreviousFocus = null;
+  resolve?.(confirmed);
+}
+function trapRetryFocus(event: KeyboardEvent) {
+  const buttons = retryDialog.value?.querySelectorAll<HTMLButtonElement>(
+    "button:not(:disabled)",
+  );
+  if (!buttons?.length) return;
+  const first = buttons[0]!;
+  const last = buttons[buttons.length - 1]!;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+function confirmRetry(error: unknown): Promise<boolean> {
+  if (
+    typeof error !== "object" ||
+    error === null ||
+    !("attemptId" in error) ||
+    typeof error.attemptId !== "string"
+  )
+    return Promise.resolve(false);
+  retryPreviousFocus =
+    document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+  retryPrompt.value = {
+    message: audioErrorMessage(error),
+    attemptId: error.attemptId,
+  };
+  void nextTick(() => retryCancelButton.value?.focus());
+  return new Promise((resolve) => {
+    retryResolve = resolve;
+  });
+}
+function withdrawPlaybackInterest() {
+  if (playbackInterest) void playbackInterest.update([]).catch(report);
+}
+let statusTimer: ReturnType<typeof setTimeout> | undefined;
+const audioLoader = new AudioBlockLoader(async (key, retry, context) => {
+  if (!context) throw new Error("Нет активной сессии воспроизведения");
+  const { bookId, chapter, blockId, offline } = JSON.parse(key) as {
+    bookId: string;
+    chapter: number;
+    blockId: string;
+    offline: boolean;
+  };
+  return invoke<SpeechAudio>("audio_block", {
+    request: {
+      bookId,
+      chapter,
+      blockId,
+      offline,
+      speed: 1,
+      retry,
+      ...context,
+    },
+  });
+});
+function audioKey(
+  bookId: string,
+  chapter: number,
+  blockId: string,
+  profileId: string,
+  offline: boolean,
+) {
+  return JSON.stringify({ bookId, chapter, blockId, profileId, offline });
+}
+function waitForPlayback(token: number) {
+  return playbackGate.wait(() => token === generation);
+}
 let audio: HTMLAudioElement | null = null;
+let audioAttempt = 0;
+let currentPrefetchKey: string | undefined;
+let currentPrefetchBlockId: string | undefined;
+let audioBaseRate = 1;
+let audioSynthesizedSpeed = 1;
 let audioCancel: (() => void) | null = null;
 let positionTimer: ReturnType<typeof setTimeout> | undefined;
 let preferencesTimer: ReturnType<typeof setTimeout> | undefined;
 let positionQueue = Promise.resolve();
 let preferenceQueue = Promise.resolve();
-let speechStop = Promise.resolve();
+const preview = new PreviewOwner(async () => {
+  if (native.value) await invoke("stop_speech");
+}, report);
 let followingUntil = 0;
 let userScrollUntil = 0;
 let openGeneration = 0;
@@ -146,24 +293,42 @@ watch(
   },
 );
 
-const colors = [
-  0xff69d9b1, 0xff5ba8ff, 0xff9b87f5, 0xffff6f91, 0xffff9f43, 0xffffd166,
-  0xff4dd0e1, 0xffa3d977,
-];
-const colorNames = [
-  "мятный",
-  "синий",
-  "фиолетовый",
-  "розовый",
-  "оранжевый",
-  "жёлтый",
-  "бирюзовый",
-  "зелёный",
-];
 const accent = computed(
   () =>
     `#${(prefs.value.primaryColor & 0xffffff).toString(16).padStart(6, "0")}`,
 );
+function luminance(rgb: number[]): number {
+  const linear = (component: number) => {
+    const value = component / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  };
+  return (
+    0.2126 * linear(rgb[0]!) +
+    0.7152 * linear(rgb[1]!) +
+    0.0722 * linear(rgb[2]!)
+  );
+}
+const accentRgb = computed(() => {
+  const rgb = prefs.value.primaryColor;
+  return [(rgb >>> 16) & 255, (rgb >>> 8) & 255, rgb & 255];
+});
+const accentForeground = computed(() =>
+  luminance(accentRgb.value) > 0.179 ? "#000000" : "#ffffff",
+);
+const accentInk = computed(() => {
+  const rgb = accentRgb.value;
+  const target = prefs.value.dark ? 255 : 0;
+  const sufficient = (value: number) =>
+    prefs.value.dark ? value >= 0.4 : value <= 0.1;
+  for (let step = 0; step <= 100; step++) {
+    const mixed = rgb.map((channel) =>
+      Math.round(channel + ((target - channel) * step) / 100),
+    );
+    if (sufficient(luminance(mixed)))
+      return `#${mixed.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
+  }
+  return prefs.value.dark ? "#ffffff" : "#000000";
+});
 const background = computed(() =>
   prefs.value.backgroundImagePath && native.value
     ? convertFileSrc(prefs.value.backgroundImagePath)
@@ -171,12 +336,14 @@ const background = computed(() =>
 );
 const themeStyle = computed(() => ({
   "--accent": accent.value,
+  "--accent-fg": accentForeground.value,
+  "--accent-ink": accentInk.value,
   "--panel-alpha": background.value ? 1 - prefs.value.surfaceTransparency : 1,
   "--reader-size": `${prefs.value.fontSize}px`,
   "--reader-line": prefs.value.lineHeight,
 }));
 function report(e: unknown) {
-  notice.value = String(e);
+  notice.value = audioErrorMessage(e);
 }
 function updateSummary(summary: BookSummary) {
   const i = books.value.findIndex((b) => b.id === summary.id);
@@ -212,7 +379,9 @@ function savePrefsNow() {
   if (!native.value) return preferenceQueue;
   const snapshot = preferencesSnapshot(prefs.value);
   const request = preferenceQueue.then(async () => {
-    await invoke("save_preferences", { preferences: snapshot });
+    await invoke("save_preferences", {
+      preferences: withCurrentBillingUnits(snapshot, prefs.value),
+    });
   });
   preferenceQueue = request.catch(report);
   return request;
@@ -224,21 +393,39 @@ function savePrefs() {
   }, 250);
 }
 function stop() {
+  preview.cancel();
   generation++;
+  audioAttempt++;
+  resolveRetry(false);
+  withdrawPlaybackInterest();
+  currentPrefetchKey = undefined;
+  currentPrefetchBlockId = undefined;
   playing.value = false;
+  paused.value = false;
+  playbackGate.cancel();
+  const player = audio;
   audioCancel?.();
   audioCancel = null;
-  if (audio) {
-    audio.pause();
-    audio.src = "";
-    audio = null;
+  if (player) {
+    player.pause();
+    player.src = "";
+    if (audio === player) audio = null;
   }
-  if (native.value)
-    speechStop = speechStop
-      .then(async () => {
-        await invoke("stop_speech");
-      })
-      .catch(report);
+  currentAudioBlock = null;
+  void savePositionNow();
+}
+function tokenIsActive(player: HTMLAudioElement) {
+  return audio === player;
+}
+function pausePlayback() {
+  if (!playing.value) return;
+  playing.value = false;
+  paused.value = true;
+  audioAttempt++;
+  playbackGate.pause();
+  if (retryPrompt.value) resolveRetry(false);
+  withdrawPlaybackInterest();
+  audio?.pause();
   void savePositionNow();
 }
 function indexAt(offset: number) {
@@ -300,13 +487,30 @@ function selectPassage(index: number, resume = false) {
   const b = book.value;
   const passage = b?.passages[index];
   if (!b || !passage) return;
+  const shouldResume = resume || playing.value;
+  if (
+    currentAudioBlock &&
+    audio &&
+    currentAudioBlock.start <= passage.start &&
+    passage.start < currentAudioBlock.end &&
+    Number.isFinite(audio.duration)
+  ) {
+    audio.currentTime =
+      blockOffsetFraction(currentAudioBlock, passage.start) * audio.duration;
+    active.value = index;
+    b.offset = passage.start;
+    completed.value = false;
+    savePosition();
+    void jump(index);
+    return;
+  }
   stop();
   active.value = index;
   b.offset = passage.start;
   completed.value = false;
   savePosition();
   void jump(index);
-  if (resume) void play();
+  if (shouldResume) void play();
 }
 function readerIntent() {
   userScrollUntil = Date.now() + 1200;
@@ -327,6 +531,10 @@ function onReaderScroll() {
   const index = Math.max(0, row.index - 1);
   const passage = book.value.passages[index];
   if (passage && index !== active.value) {
+    if (paused.value) {
+      selectPassage(index);
+      return;
+    }
     active.value = index;
     book.value.offset = passage.start;
     completed.value = false;
@@ -334,7 +542,7 @@ function onReaderScroll() {
   }
 }
 async function speakChunk(text: string, speed: number, token: number) {
-  await speechStop;
+  await preview.wait();
   if (token !== generation) return;
   await synthesizeThenPlay(
     () =>
@@ -346,20 +554,33 @@ async function speakChunk(text: string, speed: number, token: number) {
     (result) =>
       new Promise<void>((resolve, reject) => {
         const player = new Audio(`data:${result.mime};base64,${result.data}`);
-        configurePlaybackRate(player, result.playbackRate);
+        audioBaseRate = result.playbackRate ?? 1;
+        audioSynthesizedSpeed = 1;
+        configurePlaybackRate(player, audioBaseRate);
+        player.volume = Math.min(1, Math.max(0, prefs.value.volume));
         audio = player;
-        audioCancel = resolve;
-        player.onended = () => {
-          audioCancel = null;
-          audio = null;
-          resolve();
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          player.onended = null;
+          player.onerror = null;
+          if (audio === player) {
+            audio = null;
+            audioCancel = null;
+          }
+          if (error) reject(error);
+          else resolve();
         };
-        player.onerror = () => {
-          audioCancel = null;
-          audio = null;
-          reject(new Error("Не удалось воспроизвести аудио"));
-        };
-        void player.play().catch(reject);
+        audioCancel = () => finish();
+        player.onended = () => finish();
+        player.onerror = () =>
+          finish(new Error("Не удалось воспроизвести аудио"));
+        void player
+          .play()
+          .catch((error: unknown) =>
+            finish(error instanceof Error ? error : new Error(String(error))),
+          );
       }),
     () => token === generation,
   );
@@ -371,122 +592,314 @@ async function speak(text: string, speed: number, token: number) {
   }
 }
 async function play() {
-  const b = book.value;
-  if (!native.value || !b || apiKeyBusy.value || modelSaving.value) return;
-  if (prefs.value.voice === "openrouter" && !openRouter.value.hasApiKey) {
-    notice.value = "Добавьте ключ OpenRouter в настройках";
+  const initial = book.value;
+  if (
+    closing.value ||
+    !native.value ||
+    !initial ||
+    apiKeyBusy.value ||
+    modelSaving.value
+  )
     return;
-  }
-  if (completed.value && !b.passages.length) {
-    let chapter = b.chapters.length - 1;
-    while (chapter >= 0 && !b.chapters[chapter]?.text.trim()) chapter--;
-    if (chapter >= 0) {
-      await openBook(b.id, chapter, 0);
-      await play();
+  if (paused.value && loopRunning) {
+    paused.value = false;
+    playing.value = true;
+    playbackGate.resume();
+    if (audio) {
+      const player = audio;
+      const attempt = ++audioAttempt;
+      try {
+        await player.play();
+        if (
+          attempt === audioAttempt &&
+          playing.value &&
+          !paused.value &&
+          currentAudioBlock &&
+          currentPrefetchBlockId &&
+          playbackInterest
+        ) {
+          const context = await playbackInterest.update([
+            currentAudioBlock.id,
+            currentPrefetchBlockId,
+          ]);
+          if (
+            context &&
+            attempt === audioAttempt &&
+            playing.value &&
+            !paused.value
+          )
+            audioLoader.prefetch(currentPrefetchKey, true, context);
+        }
+      } catch (e) {
+        if (attempt === audioAttempt && tokenIsActive(player)) {
+          playing.value = false;
+          paused.value = true;
+          playbackGate.pause();
+          report(e);
+        }
+      }
     }
     return;
   }
-  if (!b.passages.length) return;
+  if (!initial.passages.length) return;
   if (completed.value) {
-    active.value = replayIndex(completed.value, active.value);
-    b.offset = b.passages[active.value]!.start;
+    active.value = replayIndex(true, active.value);
+    initial.offset = initial.passages[active.value]!.start;
     completed.value = false;
   }
   stop();
   const token = generation;
   playing.value = true;
+  loopRunning = true;
   notice.value = "";
   try {
     await savePrefsNow();
-    if (token !== generation) return;
-    await runPlayback({
-      isCurrent: () => token === generation,
-      current: () => {
-        const current = book.value;
-        const passage = current?.passages[active.value];
-        return current && passage ? { current, passage } : null;
-      },
-      text: ({ passage }) =>
-        pronunciation(passage.text, prefs.value.dictionary),
-      before: ({ current, passage }) => {
-        current.offset = passage.start;
+    let explicitRetry = true;
+    while (token === generation && book.value) {
+      if (!(await waitForPlayback(token))) return;
+      const current = book.value;
+      const offline = !!offlineSource.value[current.id];
+      const plan = await invoke<AudioPlan>("audio_plan", {
+        bookId: current.id,
+        chapter: current.chapter,
+        offline,
+      });
+      if (!(await waitForPlayback(token))) return;
+      let index = blockForOffset(plan.blocks, current.offset);
+      for (; index < plan.blocks.length; index++) {
+        if (!(await waitForPlayback(token))) return;
+        const block = plan.blocks[index]!;
+        const key = audioKey(
+          current.id,
+          current.chapter,
+          block.id,
+          plan.profileId,
+          offline,
+        );
+        let result: SpeechAudio;
+        let confirmedAttempt: string | undefined;
+        while (true) {
+          if (!(await waitForPlayback(token))) return;
+          if (token !== generation) return;
+          if (paused.value) continue;
+          if (!playbackInterest)
+            throw new Error("Нет активной сессии воспроизведения");
+          const context = await playbackInterest.update([block.id]);
+          if (!context || token !== generation || paused.value) continue;
+          try {
+            result = await audioLoader.get(
+              key,
+              explicitRetry || !!confirmedAttempt,
+              { ...context, confirmedAttempt },
+            );
+            explicitRetry = false;
+            break;
+          } catch (error) {
+            if (token !== generation) return;
+            if (audioErrorCode(error) === "cancelled") continue;
+            if (audioErrorCode(error) !== "retry_required") throw error;
+            do {
+              if (!(await waitForPlayback(token))) return;
+              if (token !== generation) return;
+            } while (paused.value);
+            const attemptId =
+              typeof error === "object" &&
+              error !== null &&
+              "attemptId" in error &&
+              typeof error.attemptId === "string"
+                ? error.attemptId
+                : undefined;
+            const confirmed = await confirmRetry(error);
+            if (
+              token !== generation ||
+              book.value?.id !== current.id ||
+              book.value?.chapter !== current.chapter
+            )
+              return;
+            if (!confirmed || !attemptId) {
+              stop();
+              return;
+            }
+            confirmedAttempt = attemptId;
+          }
+        }
+        do {
+          if (!(await waitForPlayback(token))) return;
+          if (token !== generation) return;
+        } while (paused.value);
+        const startingOffset = Math.max(
+          block.start,
+          Math.min(current.offset, block.end),
+        );
+        await new Promise<void>((resolve, reject) => {
+          const player = new Audio(`data:${result.mime};base64,${result.data}`);
+          audioBaseRate = result.playbackRate ?? 1;
+          audioSynthesizedSpeed = 1;
+          configurePlaybackRate(player, audioBaseRate * current.speed);
+          player.volume = Math.min(1, Math.max(0, prefs.value.volume));
+          audio = player;
+          currentAudioBlock = block;
+          let settled = false;
+          let lastSaved = 0;
+          const finish = (error?: Error) => {
+            if (settled) return;
+            settled = true;
+            player.ontimeupdate = null;
+            player.onloadedmetadata = null;
+            player.onended = null;
+            player.onerror = null;
+            if (audio === player) {
+              audio = null;
+              audioCancel = null;
+              currentAudioBlock = null;
+            }
+            if (error) reject(error);
+            else resolve();
+          };
+          audioCancel = () => finish();
+          player.onloadedmetadata = () => {
+            if (Number.isFinite(player.duration))
+              player.currentTime =
+                blockOffsetFraction(block, startingOffset) * player.duration;
+          };
+          player.ontimeupdate = () => {
+            if (
+              !playing.value ||
+              token !== generation ||
+              !Number.isFinite(player.duration) ||
+              player.duration <= 0
+            )
+              return;
+            const position = blockPosition(
+              block,
+              player.currentTime / player.duration,
+            );
+            if (!position) return;
+            const changed = position.index !== active.value;
+            active.value = position.index;
+            current.offset = position.offset;
+            if (changed || Date.now() - lastSaved >= 5000) {
+              lastSaved = Date.now();
+              savePosition();
+            }
+            if (changed) void jump();
+          };
+          player.onended = () => finish();
+          player.onerror = () =>
+            finish(new Error("Не удалось воспроизвести аудио"));
+          const next = plan.blocks[index + 1];
+          currentPrefetchKey = next
+            ? audioKey(
+                current.id,
+                current.chapter,
+                next.id,
+                plan.profileId,
+                offline,
+              )
+            : undefined;
+          currentPrefetchBlockId = next?.id;
+          const attempt = ++audioAttempt;
+          void player
+            .play()
+            .then(async () => {
+              if (
+                token !== generation ||
+                attempt !== audioAttempt ||
+                !playing.value ||
+                paused.value ||
+                !next ||
+                !playbackInterest
+              )
+                return;
+              const context = await playbackInterest.update([
+                block.id,
+                next.id,
+              ]);
+              if (
+                context &&
+                token === generation &&
+                attempt === audioAttempt &&
+                playing.value &&
+                !paused.value
+              )
+                audioLoader.prefetch(currentPrefetchKey, true, context);
+            })
+            .catch((error: unknown) => {
+              if (
+                attempt === audioAttempt &&
+                token === generation &&
+                !paused.value
+              )
+                finish(
+                  error instanceof Error ? error : new Error(String(error)),
+                );
+            });
+        });
+        if (token !== generation) return;
+        current.offset = block.end;
         savePosition();
-        void jump();
-      },
-      speak: (text) => speak(text, book.value!.speed, token),
-      advance: async ({ current, passage }) => {
-        current.offset = passage.end;
-        savePosition();
-        if (active.value + 1 < current.passages.length) {
-          active.value++;
-          return true;
-        }
-        if (current.chapter + 1 >= current.chapters.length) {
-          current.offset =
-            current.chapters[current.chapter]?.text.length ?? passage.end;
-          completed.value = true;
-          playing.value = false;
-          await savePositionNow();
-          return false;
-        }
-        clearTimeout(positionTimer);
-        let nextChapter = current.chapter + 1;
-        while (
-          nextChapter + 1 < current.chapters.length &&
-          !current.chapters[nextChapter]?.text.trim()
-        )
-          nextChapter++;
-        const nextText = current.chapters[nextChapter]?.text ?? "";
-        const nextPosition = {
-          id: current.id,
-          chapter: nextChapter,
-          offset: nextText.trim() ? 0 : nextText.length,
-          speed: current.speed,
-        };
-        positionQueue = positionQueue
-          .then(async () => {
-            if (token === generation)
-              updateSummary(
-                await invoke<BookSummary>("save_position", nextPosition),
-              );
-          })
-          .catch(report);
-        await positionQueue;
-        if (token !== generation) return false;
-        const next = await invoke<Book>("open_book", { id: current.id });
-        if (token !== generation) return false;
-        book.value = next;
-        active.value = 0;
-        await jump();
-        if (!next.passages.length) {
-          completed.value = true;
-          playing.value = false;
-          return false;
-        }
-        return true;
-      },
-    });
+      }
+      if (current.chapter + 1 >= current.chapters.length) {
+        current.offset =
+          current.chapters[current.chapter]?.text.length ?? current.offset;
+        completed.value = true;
+        playing.value = false;
+        await savePositionNow();
+        return;
+      }
+      clearTimeout(positionTimer);
+      const nextPosition = {
+        id: current.id,
+        chapter: current.chapter + 1,
+        offset: 0,
+        speed: current.speed,
+      };
+      positionQueue = positionQueue
+        .then(async () => {
+          if (token === generation)
+            updateSummary(
+              await invoke<BookSummary>("save_position", nextPosition),
+            );
+        })
+        .catch(report);
+      await positionQueue;
+      if (token !== generation) return;
+      const next = await invoke<Book>("open_book", { id: current.id });
+      if (token !== generation) return;
+      book.value = next;
+      active.value = 0;
+      await jump();
+    }
   } catch (e) {
     if (token === generation) {
       playing.value = false;
-      report(`Ошибка озвучки: ${String(e)}`);
+      paused.value = false;
+      report(`Ошибка озвучки: ${audioErrorMessage(e)}`);
+    }
+  } finally {
+    if (token === generation) {
+      loopRunning = false;
+      withdrawPlaybackInterest();
     }
   }
 }
 async function previewVoice() {
-  if (apiKeyBusy.value || modelSaving.value) return;
+  if (closing.value || apiKeyBusy.value || modelSaving.value) return;
   stop();
   const token = generation;
   if (prefs.value.voice === "openrouter" && !openRouter.value.hasApiKey) {
     notice.value = "Добавьте ключ OpenRouter в настройках";
     return;
   }
+  preview.start(token);
   try {
     await savePrefsNow();
     if (token !== generation) return;
     await speak("Здравствуйте! Так звучит выбранный голос.", 1, token);
   } catch (e) {
     if (token === generation) report(e);
+  } finally {
+    preview.finish(token);
   }
 }
 function skip(delta: number) {
@@ -499,7 +912,11 @@ function skip(delta: number) {
 }
 async function navigate(target: Page) {
   if (target === "reader" && !book.value) return;
-  if (page.value === "reader" && target !== "reader" && playing.value) stop();
+  if (
+    (page.value === "reader" && target !== "reader" && playing.value) ||
+    (page.value === "settings" && target !== "settings" && preview.active)
+  )
+    stop();
   page.value = target;
   if (target === "reader") await jump();
   if (target === "marks") await loadMarks();
@@ -507,13 +924,13 @@ async function navigate(target: Page) {
     void loadModels();
 }
 async function importBooks() {
-  if (!native.value) return;
+  if (closing.value || !native.value) return;
   try {
     const paths = await open({
       multiple: true,
       filters: [{ name: "Книги", extensions: ["epub", "fb2", "txt"] }],
     });
-    if (!paths?.length) return;
+    if (closing.value || !paths?.length) return;
     const added = await invoke<BookSummary[]>("import_books", { paths });
     for (const b of added) {
       const i = books.value.findIndex((x) => x.id === b.id);
@@ -575,6 +992,7 @@ async function removeMark(id: string, markId: string) {
   }
 }
 async function setBackground(clear = false) {
+  if (closing.value) return;
   try {
     const path = clear
       ? null
@@ -587,32 +1005,302 @@ async function setBackground(clear = false) {
             },
           ],
         });
-    if (!clear && !path) return;
+    if (closing.value || (!clear && !path)) return;
     await savePrefsNow();
-    prefs.value = await invoke<Preferences>("set_background", { path });
+    if (closing.value) return;
+    const updated = await invoke<Preferences>("set_background", { path });
+    updated.openRouterBillingUnits = { ...prefs.value.openRouterBillingUnits };
+    prefs.value = updated;
   } catch (e) {
     report(e);
   }
 }
-async function importLegacy() {
+let offlinePolling = false;
+let offlinePollPending = false;
+const pausedPollDeadlines = new Map<string, number>();
+async function refreshOfflineStatuses() {
+  if (!native.value) return;
+  if (offlinePolling) {
+    offlinePollPending = true;
+    return;
+  }
+  offlinePolling = true;
+  clearTimeout(statusTimer);
   try {
-    const path = await open({ directory: true, multiple: false });
-    if (!path) return;
-    const count = await invoke<number>("import_legacy", { path });
-    const state = await invoke<Bootstrap>("bootstrap");
-    books.value = state.books;
-    prefs.value = state.preferences;
-    voices.value = state.voices;
-    openRouter.value = state.openRouter;
-    notice.value = `Импортировано книг: ${count}`;
+    const statuses = await invoke<OfflineStatus[]>("offline_list");
+    offlineStatuses.value = Object.fromEntries(
+      statuses.map((status) => [status.bookId, status]),
+    );
+    const selected = offlineStatuses.value[offlineBookId.value];
+    if (
+      shouldRefreshPausedQuote(
+        selected,
+        offlineQuote.value,
+        offlineDialog.value,
+        offlineBusy.value,
+      )
+    ) {
+      const requestedBook = offlineBookId.value;
+      const pendingQuote = quoteOffline();
+      const quoteToken = offlineDialogGeneration;
+      void pendingQuote.then(() => {
+        if (
+          quoteToken === offlineDialogGeneration &&
+          offlineDialog.value &&
+          offlineBookId.value === requestedBook &&
+          offlineQuote.value
+        )
+          offlineInfo.value =
+            "Расчёт обновлён: завершилась отправленная до паузы часть. Проверьте его перед запуском.";
+      });
+    }
   } catch (e) {
     report(e);
+  } finally {
+    offlinePolling = false;
+    const now = Date.now();
+    for (const [bookId, deadline] of pausedPollDeadlines)
+      if (
+        deadline <= now ||
+        offlineStatuses.value[bookId]?.state === "complete"
+      )
+        pausedPollDeadlines.delete(bookId);
+    if (offlinePollPending) {
+      offlinePollPending = false;
+      void refreshOfflineStatuses();
+    } else if (
+      shouldPollOffline(
+        Object.values(offlineStatuses.value),
+        pausedPollDeadlines,
+        now,
+      )
+    )
+      statusTimer = setTimeout(() => {
+        void refreshOfflineStatuses();
+      }, 2000);
+  }
+}
+function saveSourceChoice() {
+  try {
+    localStorage.setItem(
+      "readio.offlineSource",
+      JSON.stringify(offlineSource.value),
+    );
+  } catch {
+    notice.value = "Не удалось сохранить выбор источника озвучки";
+  }
+}
+function toggleOfflineSource() {
+  const current = book.value;
+  if (!current) return;
+  if (
+    !offlineSource.value[current.id] &&
+    offlineStatuses.value[current.id]?.state !== "complete"
+  )
+    return;
+  stop();
+  offlineSource.value[current.id] = !offlineSource.value[current.id];
+  saveSourceChoice();
+}
+let offlineDialogGeneration = 0;
+function closeOffline() {
+  offlineDialogGeneration++;
+  offlineDialog.value = false;
+  offlineBusy.value = false;
+  offlinePreviousFocus?.focus();
+}
+function trapDialogFocus(event: KeyboardEvent) {
+  const items = [
+    ...(offlineDialogElement.value?.querySelectorAll<HTMLElement>(
+      'button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+    ) ?? []),
+  ];
+  if (!items.length) return;
+  const first = items[0]!;
+  const last = items[items.length - 1]!;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+async function quoteOffline() {
+  const bookId = offlineBookId.value;
+  if (!bookId) return;
+  const previousModel = offlineQuote.value?.model ?? null;
+  const preserveDraft = billingUnitDirty(
+    previousModel,
+    billingUnitDraft.value,
+    prefs.value.openRouterBillingUnits,
+  );
+  const token = ++offlineDialogGeneration;
+  offlineBusy.value = true;
+  offlineError.value = "";
+  offlineQuote.value = null;
+  offlineRetryConfirmed.value = false;
+  try {
+    const quote = await invoke<OfflineQuote>("offline_quote", { bookId });
+    if (token === offlineDialogGeneration) {
+      offlineQuote.value = quote;
+      if (!preserveDraft || quote.model !== previousModel)
+        billingUnitDraft.value = quote.model
+          ? (prefs.value.openRouterBillingUnits[quote.model] ?? "")
+          : "";
+    }
+  } catch (e) {
+    if (token === offlineDialogGeneration) offlineError.value = String(e);
+  } finally {
+    if (token === offlineDialogGeneration) offlineBusy.value = false;
+  }
+}
+async function showOffline() {
+  if (!book.value) return;
+  offlinePreviousFocus =
+    document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+  offlineDialogGeneration++;
+  offlineRetryConfirmed.value = false;
+  offlineBookId.value = book.value.id;
+  offlineDialog.value = true;
+  await nextTick();
+  offlineCloseButton.value?.focus();
+  offlineBusy.value = false;
+  offlineError.value = "";
+  offlineInfo.value = "";
+  offlineQuote.value = null;
+  const state = offlineStatuses.value[offlineBookId.value]?.state;
+  if (state !== "complete" && state !== "running") await quoteOffline();
+}
+async function saveBillingUnit() {
+  const model = offlineQuote.value?.model;
+  const bookId = offlineBookId.value;
+  if (!model || !bookId || offlineBusy.value) return;
+  const token = offlineDialogGeneration;
+  const unit = billingUnitDraft.value || null;
+  offlineBusy.value = true;
+  offlineError.value = "";
+  offlineInfo.value = "";
+  try {
+    await savePrefsNow();
+    if (closing.value) return;
+    const request = preferenceQueue.then(async () => {
+      if (closing.value) return;
+      const saved = await invoke<Preferences>("set_openrouter_billing_unit", {
+        model,
+        unit,
+      });
+      prefs.value.openRouterBillingUnits = { ...saved.openRouterBillingUnits };
+    });
+    preferenceQueue = request.catch(report);
+    await request;
+    if (token === offlineDialogGeneration && offlineBookId.value === bookId) {
+      await quoteOffline();
+      if (
+        offlineDialog.value &&
+        offlineBookId.value === bookId &&
+        offlineQuote.value
+      )
+        offlineInfo.value = "Единица сохранена. Проверьте обновлённую оценку.";
+    }
+  } catch (e) {
+    if (token === offlineDialogGeneration) offlineError.value = String(e);
+  } finally {
+    if (token === offlineDialogGeneration) offlineBusy.value = false;
+  }
+}
+async function startOffline() {
+  if (
+    closing.value ||
+    !offlineQuote.value ||
+    !offlineBookId.value ||
+    offlineBusy.value ||
+    (offlineQuote.value.retryRequiredBlocks > 0 && !offlineRetryConfirmed.value)
+  )
+    return;
+  const bookId = offlineBookId.value;
+  const token = offlineDialogGeneration;
+  const quoteId = offlineQuote.value.quoteId;
+  offlineBusy.value = true;
+  offlineError.value = "";
+  try {
+    const status = await invoke<OfflineStatus>("offline_start", {
+      bookId,
+      quoteId,
+      confirmRetries: offlineRetryConfirmed.value,
+    });
+    offlineStatuses.value[status.bookId] = status;
+    pausedPollDeadlines.delete(bookId);
+    if (token === offlineDialogGeneration) {
+      offlineQuote.value = null;
+      offlineInfo.value = "";
+    }
+    void refreshOfflineStatuses();
+  } catch (e) {
+    if (token === offlineDialogGeneration && isStaleQuoteError(e)) {
+      const pendingQuote = quoteOffline();
+      const quoteToken = offlineDialogGeneration;
+      await pendingQuote;
+      if (
+        quoteToken === offlineDialogGeneration &&
+        offlineDialog.value &&
+        offlineBookId.value === bookId &&
+        offlineQuote.value
+      )
+        offlineInfo.value = "Расчёт обновлён. Проверьте его перед запуском.";
+    } else if (token === offlineDialogGeneration)
+      offlineError.value = String(e);
+  } finally {
+    if (token === offlineDialogGeneration) offlineBusy.value = false;
+  }
+}
+async function pauseOffline() {
+  if (!offlineBookId.value || offlineBusy.value) return;
+  const bookId = offlineBookId.value;
+  const token = offlineDialogGeneration;
+  offlineBusy.value = true;
+  offlineError.value = "";
+  try {
+    const status = await invoke<OfflineStatus>("offline_pause", { bookId });
+    offlineStatuses.value[status.bookId] = status;
+    pausedPollDeadlines.set(bookId, Date.now() + 65000);
+    void refreshOfflineStatuses();
+    if (token === offlineDialogGeneration) await quoteOffline();
+  } catch (e) {
+    if (token === offlineDialogGeneration) offlineError.value = String(e);
+  } finally {
+    if (token === offlineDialogGeneration) offlineBusy.value = false;
+  }
+}
+async function removeOffline() {
+  if (!offlineBookId.value || offlineBusy.value) return;
+  if (!confirm("Удалить сохранённую офлайн-озвучку этой книги?")) return;
+  const bookId = offlineBookId.value;
+  const token = offlineDialogGeneration;
+  offlineBusy.value = true;
+  offlineError.value = "";
+  try {
+    if (book.value?.id === bookId && offlineSource.value[bookId]) stop();
+    await invoke("offline_remove", { bookId });
+    delete offlineStatuses.value[bookId];
+    pausedPollDeadlines.delete(bookId);
+    delete offlineSource.value[bookId];
+    saveSourceChoice();
+    audioLoader.clearBook(bookId);
+    if (token === offlineDialogGeneration) await quoteOffline();
+  } catch (e) {
+    if (token === offlineDialogGeneration) offlineError.value = String(e);
+  } finally {
+    if (token === offlineDialogGeneration) offlineBusy.value = false;
   }
 }
 function addDictionary() {
   const word = dictionaryWord.value.trim();
   const value = dictionaryValue.value.trim();
   if (!word || !value) return;
+  stop();
   prefs.value.dictionary[word] = value;
   dictionaryWord.value = "";
   dictionaryValue.value = "";
@@ -625,11 +1313,12 @@ async function refreshOpenRouter() {
 }
 async function saveApiKey() {
   const apiKey = apiKeyDraft.value.trim();
-  if (!apiKey || apiKeyBusy.value) return;
+  if (closing.value || !apiKey || apiKeyBusy.value) return;
   stop();
   apiKeyBusy.value = true;
   try {
-    await speechStop;
+    await preview.wait();
+    if (closing.value) return;
     openRouter.value = await invoke<OpenRouterStatus>("set_openrouter_key", {
       apiKey,
     });
@@ -649,11 +1338,12 @@ async function saveApiKey() {
   }
 }
 async function deleteApiKey() {
-  if (apiKeyBusy.value) return;
+  if (closing.value || apiKeyBusy.value) return;
   stop();
   apiKeyBusy.value = true;
   try {
-    await speechStop;
+    await preview.wait();
+    if (closing.value) return;
     openRouter.value = await invoke<OpenRouterStatus>("delete_openrouter_key");
     apiKeyDraft.value = "";
     invalidateModelCatalog();
@@ -744,11 +1434,23 @@ function changeVoice() {
 }
 function changeSpeed(event: Event) {
   if (!book.value) return;
-  const resume = playing.value;
-  stop();
   book.value.speed = Number((event.target as HTMLInputElement).value);
+  if (audio)
+    audio.playbackRate = playbackRate(
+      audioBaseRate,
+      audioSynthesizedSpeed,
+      book.value.speed,
+    );
   savePosition();
-  if (resume) void play();
+}
+function changeVolume(event: Event) {
+  const value = Math.min(
+    1,
+    Math.max(0, Number((event.target as HTMLInputElement).value)),
+  );
+  prefs.value.volume = value;
+  if (audio) audio.volume = value;
+  savePrefs();
 }
 function coverUrl(cover: string | null) {
   return cover
@@ -757,26 +1459,97 @@ function coverUrl(cover: string | null) {
       : `data:image/*;base64,${cover}`
     : "";
 }
+let shutdownPromise: Promise<void> | null = null;
+let mounted = false;
+let unlistenShutdown: (() => void) | undefined;
+let unlistenClose: (() => void) | undefined;
+function flushForShutdown(): Promise<void> {
+  if (shutdownPromise) return shutdownPromise;
+  closing.value = true;
+  shutdownError.value = "";
+  openGeneration++;
+  offlineDialogGeneration++;
+  stop();
+  shutdownPromise = Promise.allSettled([
+    savePositionNow(),
+    savePrefsNow(),
+    preview.wait(),
+    audioLoader.settle(),
+  ])
+    .then(async (results) => {
+      const errors = results.filter(
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected",
+      );
+      if (errors.length) {
+        shutdownWarning.value = `Не удалось сохранить данные: ${errors.map((error) => audioErrorMessage(error.reason)).join("; ")}`;
+        report(shutdownWarning.value);
+      }
+      await invoke("prepare_shutdown");
+    })
+    .catch((error: unknown) => {
+      shutdownPromise = null;
+      shutdownError.value = audioErrorMessage(error);
+      throw error;
+    });
+  return shutdownPromise;
+}
+async function closeWindow() {
+  try {
+    await flushForShutdown();
+    await getCurrentWindow().destroy();
+  } catch (error) {
+    shutdownError.value = audioErrorMessage(error);
+  }
+}
 onMounted(async () => {
+  mounted = true;
   native.value = isTauri();
   if (native.value) {
     try {
-      await getCurrentWindow().onCloseRequested(async (event) => {
-        event.preventDefault();
-        stop();
-        try {
-          await Promise.all([savePositionNow(), savePrefsNow(), speechStop]);
-          await getCurrentWindow().destroy();
-        } catch (e) {
-          report(e);
-        }
+      const removeShutdown = await listen("shutdown-requested", () => {
+        void flushForShutdown().catch(report);
       });
+      if (!mounted) {
+        removeShutdown();
+        return;
+      }
+      unlistenShutdown = removeShutdown;
+      const removeClose = await getCurrentWindow().onCloseRequested((event) => {
+        event.preventDefault();
+        void closeWindow();
+      });
+      if (!mounted) {
+        removeClose();
+        return;
+      }
+      unlistenClose = removeClose;
+      const session = await invoke<string>("audio_session");
+      if (!mounted || closing.value) return;
+      playbackInterest = new PlaybackInterest(
+        session,
+        (session, revision, blockIds) =>
+          invoke<boolean>("audio_interest", { session, revision, blockIds }),
+      );
       const state = await invoke<Bootstrap>("bootstrap");
+      if (!mounted || closing.value) return;
       books.value = state.books;
       prefs.value = state.preferences;
       voices.value = state.voices;
       openRouter.value = state.openRouter;
       notice.value = state.warnings.join("\n");
+      try {
+        const saved: unknown = JSON.parse(
+          localStorage.getItem("readio.offlineSource") ?? "{}",
+        );
+        if (saved && typeof saved === "object" && !Array.isArray(saved))
+          offlineSource.value = Object.fromEntries(
+            Object.entries(saved).filter(([, value]) => value === true),
+          );
+      } catch {
+        offlineSource.value = {};
+      }
+      void refreshOfflineStatuses();
     } catch (e) {
       report(e);
     }
@@ -784,6 +1557,10 @@ onMounted(async () => {
   loading.value = false;
 });
 onBeforeUnmount(() => {
+  mounted = false;
+  unlistenShutdown?.();
+  unlistenClose?.();
+  clearTimeout(statusTimer);
   stop();
   void savePrefsNow().catch(() => {});
 });
@@ -804,7 +1581,7 @@ onBeforeUnmount(() => {
       class="backdrop dim"
       :style="{ opacity: prefs.backgroundDim }"
     />
-    <aside class="rail panel">
+    <aside class="rail panel" :inert="closing">
       <div class="brand">READIO</div>
       <nav aria-label="Главная навигация">
         <button
@@ -837,7 +1614,7 @@ onBeforeUnmount(() => {
         <Plus />Добавить книгу
       </button>
     </aside>
-    <main class="main">
+    <main class="main" :inert="closing">
       <div v-if="notice" class="notice" role="status">
         <span>{{ notice }}</span
         ><button
@@ -885,7 +1662,20 @@ onBeforeUnmount(() => {
                       width: `${Math.max(0, Math.min(100, item.progress * 100))}%`,
                     }" /></span
                 ><small
-                  >{{ Math.round(item.progress * 100) }}% прочитано</small
+                  >{{ Math.round(item.progress * 100) }}% прочитано
+                  <span
+                    v-if="offlineStatuses[item.id]?.state === 'complete'"
+                    class="offline-badge"
+                    ><CloudOff :size="14" /> Офлайн-аудио</span
+                  ><span
+                    v-else-if="offlineStatuses[item.id]?.state === 'running'"
+                    class="offline-badge"
+                  >
+                    · Сохраняется
+                    {{ offlineStatuses[item.id]?.cachedBlocks }}/{{
+                      offlineStatuses[item.id]?.totalBlocks
+                    }}</span
+                  ></small
                 ></span
               ></button
             ><button
@@ -905,6 +1695,31 @@ onBeforeUnmount(() => {
             <strong>{{ book.title }}</strong
             ><span>{{ book.author }}</span>
           </div>
+          <button
+            v-if="
+              offlineSource[book.id] ||
+              offlineStatuses[book.id]?.state === 'complete'
+            "
+            class="text-button source-button"
+            :title="
+              offlineSource[book.id]
+                ? 'Использовать текущий голос'
+                : 'Использовать сохранённую озвучку'
+            "
+            @click="toggleOfflineSource"
+          >
+            <CloudOff />{{
+              offlineSource[book.id] ? "Сохранённая озвучка" : "Текущий голос"
+            }}
+          </button>
+          <button
+            class="tonal"
+            title="Сохранить озвучку офлайн"
+            aria-label="Сохранить озвучку офлайн"
+            @click="showOffline"
+          >
+            <Download /> Офлайн
+          </button>
           <button
             class="icon"
             title="Добавить закладку"
@@ -976,7 +1791,11 @@ onBeforeUnmount(() => {
         </div>
         <footer class="player panel">
           <div class="progress thin">
-            <i :style="{ width: `${book.progress * 100}%` }" />
+            <i
+              :style="{
+                width: `${Math.max(0, Math.min(100, book.progress * 100))}%`,
+              }"
+            />
           </div>
           <div class="player-row">
             <div class="player-book">
@@ -984,8 +1803,12 @@ onBeforeUnmount(() => {
                 ><img
                   v-if="book.cover"
                   :src="coverUrl(book.cover)"
-                  alt="" /><BookOpen v-else /></span
-              ><span>{{ book.title }}</span>
+                  alt="" /><BookOpen v-else
+              /></span>
+              <span class="player-book-info"
+                ><strong>{{ book.title }}</strong
+                ><small>{{ book.author }}</small></span
+              >
             </div>
             <div class="controls">
               <button
@@ -994,53 +1817,59 @@ onBeforeUnmount(() => {
                 aria-label="Предыдущее предложение"
                 @click="skip(-1)"
               >
-                <SkipBack /></button
-              ><button
+                <SkipBack />
+              </button>
+              <button
                 class="play-button"
                 :title="playing ? 'Пауза' : 'Воспроизвести'"
                 :aria-label="playing ? 'Пауза' : 'Воспроизвести'"
-                @click="playing ? stop() : play()"
+                @click="playing ? pausePlayback() : play()"
               >
-                <Pause v-if="playing" /><Play v-else /></button
-              ><button
+                <Pause v-if="playing" /><Play v-else />
+              </button>
+              <button
                 class="icon"
                 title="Следующее предложение"
                 aria-label="Следующее предложение"
                 @click="skip(1)"
               >
-                <SkipForward /></button
-              ><button
-                class="icon"
-                title="Стоп"
-                aria-label="Стоп"
-                @click="stop"
-              >
+                <SkipForward />
+              </button>
+              <button class="icon" title="Стоп" aria-label="Стоп" @click="stop">
                 <Square />
               </button>
             </div>
             <div class="player-end">
-              <span>{{ book.speed.toFixed(1) }}×</span
-              ><button
-                class="icon"
-                title="Дополнительно"
-                aria-label="Дополнительно"
-                @click="compact = !compact"
+              <div
+                class="player-progress"
+                :aria-label="`Прочитано ${Math.round(book.progress * 100)}%`"
               >
-                <ChevronDown v-if="compact" /><ChevronUp v-else />
-              </button>
+                <small>{{ Math.round(book.progress * 100) }}%</small>
+              </div>
+              <label class="player-slider" title="Скорость"
+                ><span>{{ book.speed.toFixed(1) }}×</span
+                ><input
+                  type="range"
+                  min="0.5"
+                  max="3"
+                  step="0.1"
+                  :value="book.speed"
+                  aria-label="Скорость"
+                  @input="changeSpeed"
+              /></label>
+              <label class="player-slider volume-slider" title="Громкость"
+                ><Volume2 aria-hidden="true" /><input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  :value="prefs.volume"
+                  aria-label="Громкость"
+                  @input="changeVolume"
+                /><span>{{ Math.round(prefs.volume * 100) }}%</span></label
+              >
             </div>
           </div>
-          <label v-if="!compact" class="speed-row"
-            ><span>Скорость</span
-            ><input
-              type="range"
-              min="0.5"
-              max="3"
-              step="0.1"
-              :value="book.speed"
-              @change="changeSpeed"
-            /><span>0,5–3,0× · голос может ограничить</span></label
-          >
         </footer>
       </section>
       <section v-else-if="page === 'marks'" class="view">
@@ -1088,25 +1917,10 @@ onBeforeUnmount(() => {
         <div class="setting">
           <strong>Оформление</strong
           ><small>Основной цвет и фоновое изображение</small>
-          <div class="colors">
-            <button
-              v-for="(color, index) in colors"
-              :key="color"
-              class="color"
-              :class="{ chosen: prefs.primaryColor === color }"
-              :style="{
-                background: `#${(color & 0xffffff).toString(16).padStart(6, '0')}`,
-              }"
-              :aria-label="`Цвет ${colorNames[index]}`"
-              :aria-pressed="prefs.primaryColor === color"
-              @click="
-                prefs.primaryColor = color;
-                savePrefs();
-              "
-            >
-              {{ prefs.primaryColor === color ? "✓" : "" }}
-            </button>
-          </div>
+          <AccentColorPicker
+            v-model="prefs.primaryColor"
+            @update:model-value="savePrefs"
+          />
           <div class="actions">
             <button class="tonal" :disabled="!native" @click="setBackground()">
               <ImageIcon />{{
@@ -1128,14 +1942,13 @@ onBeforeUnmount(() => {
               v-model="prefs.backgroundBlurEnabled"
               type="checkbox"
               @change="savePrefs" /></label
-          ><label class="setting"
+          ><label v-if="prefs.backgroundBlurEnabled" class="setting"
             >Сила размытия · {{ Math.round(prefs.backgroundBlur * 100) }}%<input
               v-model.number="prefs.backgroundBlur"
               type="range"
               min="0"
               max="1"
               step="0.05"
-              :disabled="!prefs.backgroundBlurEnabled"
               @input="savePrefs" /></label
           ><img
             class="background-preview"
@@ -1387,15 +2200,6 @@ onBeforeUnmount(() => {
         >
           Русский голос не найден в списке доступных голосов.
         </p>
-        <label v-if="book" class="setting"
-          >Скорость для «{{ book.title }}» · {{ book.speed.toFixed(1) }}×<input
-            type="range"
-            min="0.5"
-            max="3"
-            step="0.1"
-            :value="book.speed"
-            @change="changeSpeed"
-        /></label>
         <hr />
         <div class="setting">
           <strong>Словарь произношения</strong
@@ -1420,6 +2224,7 @@ onBeforeUnmount(() => {
               class="icon"
               :aria-label="`Удалить ${word}`"
               @click="
+                stop();
                 delete prefs.dictionary[word];
                 savePrefs();
               "
@@ -1428,17 +2233,330 @@ onBeforeUnmount(() => {
             </button>
           </div>
         </div>
-        <hr />
-        <div class="setting">
-          <strong>Перенос библиотеки</strong
-          ><small>Импорт книг и настроек из папки данных Flutter Readio</small>
-          <div>
-            <button class="tonal" :disabled="!native" @click="importLegacy">
-              Импортировать библиотеку
+      </section>
+      <div
+        v-if="retryPrompt"
+        class="dialog-overlay"
+        @keydown.esc="resolveRetry(false)"
+        @click.self="resolveRetry(false)"
+      >
+        <section
+          ref="retryDialog"
+          class="offline-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="retry-heading"
+          aria-describedby="retry-description"
+          @keydown.tab="trapRetryFocus"
+        >
+          <header class="dialog-heading">
+            <h2 id="retry-heading">Повторить запрос?</h2>
+          </header>
+          <p id="retry-description">
+            {{ retryPrompt.message }} Повторный запрос может привести к
+            дополнительному списанию.
+          </p>
+          <div class="dialog-actions">
+            <button class="tonal" @click="resolveRetry(true)">
+              Повторить запрос
+            </button>
+            <button
+              ref="retryCancelButton"
+              class="text-button"
+              @click="resolveRetry(false)"
+            >
+              Отмена
             </button>
           </div>
-        </div>
-      </section>
+        </section>
+      </div>
+      <div
+        v-if="offlineDialog"
+        class="dialog-overlay"
+        @keydown.esc="closeOffline"
+        @click.self="closeOffline"
+      >
+        <section
+          ref="offlineDialogElement"
+          class="offline-dialog"
+          role="dialog"
+          @keydown.tab="trapDialogFocus"
+          aria-modal="true"
+          aria-labelledby="offline-heading"
+        >
+          <header class="dialog-heading">
+            <h2 id="offline-heading">Сохранить озвучку офлайн</h2>
+            <button
+              ref="offlineCloseButton"
+              class="icon"
+              aria-label="Закрыть"
+              @click="closeOffline"
+            >
+              <X />
+            </button>
+          </header>
+          <p>
+            Книга отправляется на озвучку частями. Для облачного голоса текст
+            передаётся выбранному сервису.
+          </p>
+          <template
+            v-if="
+              offlineStatuses[offlineBookId] &&
+              offlineStatuses[offlineBookId]?.state !== 'none'
+            "
+          >
+            <p class="offline-state">
+              {{
+                (
+                  {
+                    running: "Сохранение",
+                    paused: "Приостановлено",
+                    complete: "Сохранено",
+                    error: "Ошибка",
+                    none: "",
+                  } as const
+                )[offlineStatuses[offlineBookId]!.state]
+              }}
+              · {{ offlineStatuses[offlineBookId]!.cachedBlocks }} /
+              {{ offlineStatuses[offlineBookId]!.totalBlocks }} частей
+            </p>
+            <div class="progress">
+              <i
+                :style="{
+                  width: `${offlineStatuses[offlineBookId]!.totalBlocks ? Math.min(100, (offlineStatuses[offlineBookId]!.cachedBlocks / offlineStatuses[offlineBookId]!.totalBlocks) * 100) : 0}%`,
+                }"
+              />
+            </div>
+            <p v-if="offlineStatuses[offlineBookId]?.error" class="warning">
+              {{ offlineStatuses[offlineBookId]?.error }}
+            </p>
+          </template>
+          <p v-if="offlineBusy" role="status">Загрузка…</p>
+          <p v-if="offlineInfo" role="status">{{ offlineInfo }}</p>
+          <p v-if="offlineError" class="warning" role="alert">
+            {{ offlineError }}
+          </p>
+          <template v-if="offlineQuote">
+            <dl class="quote-details">
+              <div>
+                <dt>Движок</dt>
+                <dd>{{ offlineQuote.engine }}</dd>
+              </div>
+              <div>
+                <dt>Голос</dt>
+                <dd>
+                  {{
+                    offlineQuote.engine === "openrouter"
+                      ? offlineQuote.modelVoice || "По умолчанию"
+                      : offlineQuote.voice
+                  }}
+                </dd>
+              </div>
+              <div>
+                <dt>Модель</dt>
+                <dd>
+                  {{ offlineQuote.model ?? "Системный или локальный голос" }}
+                </dd>
+              </div>
+              <div>
+                <dt>Всего частей</dt>
+                <dd>{{ offlineQuote.totalBlocks }}</dd>
+              </div>
+              <div>
+                <dt>Уже сохранено</dt>
+                <dd>{{ offlineQuote.cachedBlocks }}</dd>
+              </div>
+              <div>
+                <dt>Осталось</dt>
+                <dd>
+                  {{
+                    Math.max(
+                      0,
+                      offlineQuote.totalBlocks - offlineQuote.cachedBlocks,
+                    )
+                  }}
+                </dd>
+              </div>
+              <div>
+                <dt>Символов к озвучке</dt>
+                <dd>{{ offlineQuote.characters.toLocaleString("ru-RU") }}</dd>
+              </div>
+              <div
+                v-if="
+                  offlineQuote.billableUnits !== null &&
+                  offlineQuote.estimateSource === 'user'
+                "
+              >
+                <dt>
+                  {{
+                    offlineQuote.costUnit === "utf8_byte"
+                      ? "UTF-8 байтов к озвучке"
+                      : "Тарифицируемых символов"
+                  }}
+                </dt>
+                <dd>
+                  {{ offlineQuote.billableUnits.toLocaleString("ru-RU") }}
+                </dd>
+              </div>
+              <div>
+                <dt>Стоимость</dt>
+                <dd>
+                  {{
+                    offlineQuote.costUnit === "free"
+                      ? "Бесплатно"
+                      : offlineQuote.estimateSource === "user" &&
+                          offlineQuote.estimatedCost !== null
+                        ? `≈ $${offlineQuote.estimatedCost}`
+                        : "Неизвестна"
+                  }}
+                </dd>
+              </div>
+            </dl>
+            <p>
+              Приложение отправляет запросами до
+              {{ offlineQuote.maxPassages }} предложений и
+              {{ offlineQuote.maxBlockBytes }} байт после экранирования. Это
+              внутренний предел; ограничения провайдера могут отличаться.
+            </p>
+            <p
+              v-if="offlineQuote.retryRequiredBlocks > 0"
+              class="warning"
+              id="offline-retry-warning"
+            >
+              Для {{ offlineQuote.retryRequiredBlocks }} блоков предыдущая
+              генерация не сохранилась или её результат неизвестен. Повтор может
+              быть оплачен ещё раз.
+            </p>
+            <label v-if="offlineQuote.retryRequiredBlocks > 0">
+              <input
+                v-model="offlineRetryConfirmed"
+                type="checkbox"
+                :disabled="offlineBusy"
+                aria-describedby="offline-retry-warning"
+              />
+              Я согласен на повторную генерацию и возможное дополнительное
+              списание
+            </label>
+            <p>Переходы внутри аудиофрагмента приблизительные.</p>
+            <p v-if="offlineQuote.estimateSource === 'user'">
+              Оценка рассчитана по единице, указанной вами; фактическое списание
+              может отличаться.
+            </p>
+            <p v-if="offlineQuote.costUnit === 'unknown'">
+              Точная стоимость неизвестна.
+              <template
+                v-if="offlineQuote.costReason === 'providerunitunavailable'"
+                >OpenRouter не сообщает подтверждённую единицу
+                тарификации.</template
+              >
+              <template
+                v-else-if="
+                  offlineQuote.costReason === 'additionalrateunitunavailable'
+                "
+                >Для дополнительной ставки единица тарификации
+                неизвестна.</template
+              >
+              <template v-else-if="offlineQuote.costReason === 'invalidrate'"
+                >Тариф API не удалось прочитать.</template
+              >
+              Проверьте тариф на странице модели до запуска.
+            </p>
+            <p v-if="offlineQuote.pricing">
+              Тариф API, USD: вход
+              {{ offlineQuote.pricing.prompt || "не указан" }}, выход
+              {{ offlineQuote.pricing.completion || "не указан" }}.
+            </p>
+            <div
+              v-if="
+                offlineQuote.engine === 'openrouter' &&
+                offlineQuote.model &&
+                offlineQuote.costUnit !== 'free'
+              "
+              class="billing-unit"
+            >
+              <label
+                >Единица тарифа модели
+                <select v-model="billingUnitDraft" :disabled="offlineBusy">
+                  <option value="">Не указана</option>
+                  <option value="character">Символы</option>
+                  <option value="utf8_byte">Байты UTF-8</option>
+                </select>
+              </label>
+              <button
+                type="button"
+                class="tonal"
+                :disabled="offlineBusy"
+                @click="saveBillingUnit"
+              >
+                Сохранить и пересчитать
+              </button>
+              <small
+                >Укажите единицу по странице модели. Приложение не определяет её
+                автоматически.<template v-if="billingDirty">
+                  Сохраните выбор и проверьте обновлённый расчёт перед
+                  запуском.</template
+                ></small
+              >
+            </div>
+          </template>
+          <div class="dialog-actions">
+            <button
+              v-if="offlineQuote"
+              class="primary"
+              :disabled="
+                offlineBusy ||
+                billingDirty ||
+                (offlineQuote.retryRequiredBlocks > 0 && !offlineRetryConfirmed)
+              "
+              @click="startOffline"
+            >
+              {{
+                offlineStatuses[offlineBookId]?.state === "paused"
+                  ? "Продолжить сохранение"
+                  : "Начать сохранение"
+              }}</button
+            ><button
+              v-if="offlineStatuses[offlineBookId]?.state === 'running'"
+              class="tonal"
+              :disabled="offlineBusy"
+              @click="pauseOffline"
+            >
+              Приостановить</button
+            ><button
+              v-if="
+                offlineStatuses[offlineBookId]?.state === 'complete' ||
+                offlineStatuses[offlineBookId]?.state === 'paused' ||
+                offlineStatuses[offlineBookId]?.state === 'error'
+              "
+              class="text-button"
+              :disabled="offlineBusy"
+              @click="removeOffline"
+            >
+              Удалить сохранённую озвучку</button
+            ><button
+              v-if="offlineError && !offlineBusy"
+              class="tonal"
+              @click="quoteOffline"
+            >
+              Повторить расчёт</button
+            ><button class="text-button" @click="closeOffline">Закрыть</button>
+          </div>
+        </section>
+      </div>
     </main>
+    <div v-if="closing" class="dialog-overlay" role="status" aria-live="polite">
+      <section class="offline-dialog">
+        <p v-if="!shutdownError">Сохранение данных и завершение работы…</p>
+        <p v-if="shutdownWarning" class="warning">{{ shutdownWarning }}</p>
+        <template v-if="shutdownError">
+          <p class="warning">
+            Не удалось завершить работу: {{ shutdownError }}
+          </p>
+          <button class="tonal" @click="closeWindow">
+            Повторить завершение
+          </button>
+        </template>
+      </section>
+    </div>
   </div>
 </template>

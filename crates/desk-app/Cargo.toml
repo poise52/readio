@@ -17,6 +17,8 @@ tauri-build.workspace = true
 desk-core = { path = "../desk-core", version = "0.1.0" }
 readio-speech = { path = "../desk-render", version = "0.1.0" }
 serde.workspace = true
+base64.workspace = true
+uuid.workspace = true
 tauri.workspace = true
 tauri-plugin-dialog.workspace = true
 tokio.workspace = true
@@ -27,3 +29,6 @@ keyring.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

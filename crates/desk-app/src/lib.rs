@@ -1,4 +1,12 @@
+mod block_error;
 mod credentials;
+mod instance;
+mod lifecycle;
+mod offline;
+mod request_queue;
+mod tasks;
+#[cfg(test)]
+mod test_provider;
 
 use desk_core::{Book, BookSummary, BookmarkEntry, Mark, Preferences, Store};
 use readio_speech::{OpenRouterModel, SpeechAudio, SpeechService, Voice};
@@ -8,11 +16,14 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 struct AppState {
+    _instance: instance::InstanceGuard,
+    lifecycle: lifecycle::Lifecycle,
     store: Arc<Mutex<Store>>,
     speech: SpeechService,
+    offline: Arc<offline::OfflineManager>,
     openrouter_catalog: tokio::sync::Mutex<Option<CachedCatalog>>,
 }
 struct CachedCatalog {
@@ -157,7 +168,8 @@ async fn open_book(state: State<'_, AppState>, id: String) -> IpcResult<Book> {
 }
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned command arguments.
-fn delete_book(state: State<'_, AppState>, id: String) -> IpcResult<()> {
+async fn delete_book(state: State<'_, AppState>, id: String) -> IpcResult<()> {
+    state.offline.remove_all(&id).await?;
     with_store(&state, |s| s.delete(&id))
 }
 #[tauri::command]
@@ -200,6 +212,7 @@ fn save_preferences(
     with_store(&state, |store| {
         let previous = store.preferences()?;
         let mut preferences = preferences;
+        preferences.open_router_billing_units = previous.open_router_billing_units.clone();
         migrate_provider(&mut preferences);
         if previous.open_router_model != preferences.open_router_model {
             preferences.open_router_voice = None;
@@ -253,9 +266,7 @@ async fn set_openrouter_key(
     credentials::validate_key(&api_key).map_err(str::to_owned)?;
     let mut cache = state.openrouter_catalog.lock().await;
     state.speech.stop().await;
-    tauri::async_runtime::spawn_blocking(move || credentials::write(&api_key))
-        .await
-        .map_err(|e| e.to_string())??;
+    state.offline.change_credentials(Some(api_key)).await?;
     *cache = None;
     drop(cache);
     Ok(OpenRouterStatus { has_api_key: true })
@@ -264,12 +275,39 @@ async fn set_openrouter_key(
 async fn delete_openrouter_key(state: State<'_, AppState>) -> IpcResult<OpenRouterStatus> {
     let mut cache = state.openrouter_catalog.lock().await;
     state.speech.stop().await;
-    tauri::async_runtime::spawn_blocking(credentials::delete)
-        .await
-        .map_err(|e| e.to_string())??;
+    state.offline.change_credentials(None).await?;
     *cache = None;
     drop(cache);
     Ok(OpenRouterStatus { has_api_key: false })
+}
+async fn synthesize_openrouter(
+    state: &State<'_, AppState>,
+    text: &str,
+    speed: f32,
+) -> IpcResult<SpeechAudio> {
+    let generation = state.speech.cancellation_generation();
+    let preferences = with_store(state, Store::preferences)?;
+    let model = preferences
+        .open_router_model
+        .as_deref()
+        .ok_or_else(|| "Выберите TTS-модель OpenRouter".to_owned())?;
+    let (models, key) = catalog(state, false, true).await?;
+    if !models.iter().any(|candidate| candidate.id == model) {
+        return Err("Выбранная TTS-модель OpenRouter недоступна; обновите список моделей".into());
+    }
+    let key = key.ok_or_else(|| "Добавьте ключ OpenRouter в настройках".to_owned())?;
+    state
+        .speech
+        .synthesize_with_openrouter_if_current(
+            text,
+            &key,
+            model,
+            preferences.open_router_voice.as_deref(),
+            speed,
+            generation,
+        )
+        .await
+        .map_err(|e| e.to_string())
 }
 #[tauri::command]
 async fn synthesize(
@@ -279,31 +317,7 @@ async fn synthesize(
     speed: f32,
 ) -> IpcResult<SpeechAudio> {
     if matches!(voice.as_deref(), Some("openrouter" | LEGACY_FISH_VOICE)) {
-        let generation = state.speech.cancellation_generation();
-        let preferences = with_store(&state, Store::preferences)?;
-        let model = preferences
-            .open_router_model
-            .as_deref()
-            .ok_or_else(|| "Выберите TTS-модель OpenRouter".to_owned())?;
-        let (models, key) = catalog(&state, false, true).await?;
-        if !models.iter().any(|candidate| candidate.id == model) {
-            return Err(
-                "Выбранная TTS-модель OpenRouter недоступна; обновите список моделей".into(),
-            );
-        }
-        let key = key.ok_or_else(|| "Добавьте ключ OpenRouter в настройках".to_owned())?;
-        return state
-            .speech
-            .synthesize_with_openrouter_if_current(
-                &text,
-                &key,
-                model,
-                preferences.open_router_voice.as_deref(),
-                speed,
-                generation,
-            )
-            .await
-            .map_err(|e| e.to_string());
+        return synthesize_openrouter(&state, &text, speed).await;
     }
     state
         .speech
@@ -312,10 +326,44 @@ async fn synthesize(
         .map_err(|e| e.to_string())
 }
 #[tauri::command]
+async fn synthesize_many(
+    state: State<'_, AppState>,
+    texts: Vec<String>,
+    voice: Option<String>,
+    speed: f32,
+) -> IpcResult<SpeechAudio> {
+    if matches!(voice.as_deref(), Some("openrouter" | LEGACY_FISH_VOICE)) {
+        let joined = readio_speech::validate_and_join_texts(
+            &texts.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .map_err(|e| e.to_string())?;
+        return synthesize_openrouter(&state, &joined, speed).await;
+    }
+    state
+        .speech
+        .synthesize_many(
+            &texts.iter().map(String::as_str).collect::<Vec<_>>(),
+            voice.as_deref(),
+            speed,
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
 async fn stop_speech(state: State<'_, AppState>) -> IpcResult<()> {
     state.speech.stop().await;
     Ok(())
 }
+#[tauri::command]
+async fn prepare_shutdown(state: State<'_, AppState>) -> IpcResult<()> {
+    state.lifecycle.frontend_ready();
+    state.offline.begin_shutdown();
+    state.offline.shutdown().await;
+    state.speech.stop().await;
+    state.lifecycle.mark_drained();
+    Ok(())
+}
+
 /// Starts the desktop application.
 ///
 /// # Errors
@@ -326,11 +374,18 @@ pub fn run() -> tauri::Result<()> {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let root = app.path().app_data_dir()?;
+            let instance = instance::InstanceGuard::acquire(&root)?;
             let store = Store::open(&root)?;
-            let speech = SpeechService::new(root)?;
+            let speech = SpeechService::new(root.clone())?;
+            let store = Arc::new(Mutex::new(store));
+            let offline = offline::OfflineManager::new(Arc::clone(&store), root)
+                .map_err(std::io::Error::other)?;
             app.manage(AppState {
-                store: Arc::new(Mutex::new(store)),
+                _instance: instance,
+                lifecycle: lifecycle::Lifecycle::new(),
+                store,
                 speech,
+                offline,
                 openrouter_catalog: tokio::sync::Mutex::new(None),
             });
             Ok(())
@@ -352,9 +407,50 @@ pub fn run() -> tauri::Result<()> {
             set_openrouter_key,
             delete_openrouter_key,
             synthesize,
-            stop_speech
+            synthesize_many,
+            stop_speech,
+            prepare_shutdown,
+            offline::audio_session,
+            offline::audio_interest,
+            offline::audio_plan,
+            offline::audio_block,
+            offline::offline_quote,
+            offline::set_openrouter_billing_unit,
+            offline::offline_start,
+            offline::offline_status,
+            offline::offline_list,
+            offline::offline_pause,
+            offline::offline_remove
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())?
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                let state = app.state::<AppState>();
+                if state.lifecycle.is_drained() {
+                    return;
+                }
+                api.prevent_exit();
+                state.offline.begin_shutdown();
+                if !state.lifecycle.begin_exit() {
+                    return;
+                }
+                let _ = app.emit("shutdown-requested", ());
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app.state::<AppState>();
+                    state.offline.shutdown().await;
+                    state.speech.stop().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        state.lifecycle.wait_frontend(),
+                    )
+                    .await;
+                    state.lifecycle.mark_drained();
+                    app.exit(code.unwrap_or(0));
+                });
+            }
+        });
+    Ok(())
 }
 
 #[cfg(all(test, not(dev)))]

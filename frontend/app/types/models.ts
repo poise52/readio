@@ -41,7 +41,9 @@ export interface Preferences {
   surfaceTransparency: number;
   voice: string | null;
   openRouterModel: string | null;
+  openRouterBillingUnits: Record<string, "character" | "utf8_byte">;
   openRouterVoice: string | null;
+  volume: number;
   dictionary: Record<string, string>;
 }
 export interface Voice {
@@ -72,4 +74,59 @@ export interface SpeechAudio {
   data: string;
   mime: string;
   playbackRate?: number;
+}
+export interface AudioPart {
+  index: number;
+  start: number;
+  end: number;
+  weight: number;
+}
+export interface AudioBlock {
+  id: string;
+  chapter: number;
+  start: number;
+  end: number;
+  passages: AudioPart[];
+  text: string;
+  characters: number;
+}
+export interface AudioPlan {
+  profileId: string;
+  blocks: AudioBlock[];
+  offline: boolean;
+}
+export interface OfflineStatus {
+  bookId: string;
+  profileId: string | null;
+  state: "none" | "paused" | "running" | "complete" | "error";
+  totalBlocks: number;
+  cachedBlocks: number;
+  bytes: number;
+  error: string | null;
+}
+export interface OfflineQuote {
+  quoteId: string;
+  profileId: string;
+  model: string | null;
+  engine: string;
+  voice: string;
+  modelVoice: string | null;
+  totalBlocks: number;
+  cachedBlocks: number;
+  retryRequiredBlocks: number;
+  characters: number;
+  maxBlockBytes: number;
+  maxPassages: number;
+  limitSource: "app";
+  pricing: { prompt: string; completion: string } | null;
+  estimatedCost: string | null;
+  costReason:
+    | "providerunitunavailable"
+    | "additionalrateunitunavailable"
+    | "invalidrate"
+    | null;
+  estimateSource: "user" | "free" | null;
+  billableUnits: number | null;
+  costUnit: "free" | "unknown" | "character" | "utf8_byte";
+  expiresAt: number;
 }

@@ -160,6 +160,12 @@ fn push_passage(result: &mut Vec<Passage>, raw: &str, offset: usize) {
         });
     }
 }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingUnit {
+    Character,
+    Utf8Byte,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Preferences {
@@ -176,7 +182,14 @@ pub struct Preferences {
     pub voice: Option<String>,
     pub open_router_model: Option<String>,
     pub open_router_voice: Option<String>,
+    pub open_router_billing_units: BTreeMap<String, BillingUnit>,
+    #[serde(default = "default_volume")]
+    pub volume: f64,
     pub dictionary: BTreeMap<String, String>,
+}
+#[must_use]
+const fn default_volume() -> f64 {
+    1.0
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -194,6 +207,8 @@ impl Default for Preferences {
             voice: None,
             open_router_model: None,
             open_router_voice: None,
+            open_router_billing_units: BTreeMap::new(),
+            volume: default_volume(),
             dictionary: BTreeMap::new(),
         }
     }
@@ -207,10 +222,11 @@ mod tests {
         assert_eq!(prefs.open_router_model, None);
         assert_eq!(prefs.open_router_voice, None);
         assert!(
-            serde_json::to_value(prefs)?
+            serde_json::to_value(&prefs)?
                 .get("openRouterVoice")
                 .is_some()
         );
+        assert_eq!(prefs.volume, 1.0);
         Ok(())
     }
     #[test]

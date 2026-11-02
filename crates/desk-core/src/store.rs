@@ -291,12 +291,19 @@ impl Store {
             .optional()?;
         data.map_or_else(
             || Ok(Preferences::default()),
-            |s| Ok(serde_json::from_str(&s)?),
+            |s| {
+                let mut prefs: Preferences = serde_json::from_str(&s)?;
+                prefs.volume = prefs.volume.clamp(0.0, 1.0);
+                Ok(prefs)
+            },
         )
     }
     /// # Errors
     /// Returns an error if the settings are invalid or cannot be stored.
     pub fn save_preferences(&self, prefs: &Preferences) -> Result<Preferences> {
+        if !prefs.volume.is_finite() || !(0.0..=1.0).contains(&prefs.volume) {
+            return Err(Error::Format("Громкость должна быть от 0 до 1".into()));
+        }
         if ![
             (prefs.font_size, 10.0, 60.0),
             (prefs.line_height, 0.8, 3.0),
@@ -392,6 +399,7 @@ impl Store {
         prefs.background_dim = prefs.background_dim.clamp(0.0, 0.8);
         prefs.background_blur = prefs.background_blur.clamp(0.0, 1.0);
         prefs.surface_transparency = prefs.surface_transparency.clamp(0.0, 0.75);
+        prefs.volume = prefs.volume.clamp(0.0, 1.0);
         prefs.voice = prefs.voice.as_deref().and_then(|v| {
             if v.starts_with("Edge Дмитрий") {
                 Some("ru-RU-DmitryNeural".to_owned())
@@ -510,6 +518,31 @@ mod tests {
         let prefs = store.preferences()?;
         assert_eq!(prefs.font_size, 60.0);
         assert_eq!(prefs.voice.as_deref(), Some("ru-RU-DmitryNeural"));
+        drop(store);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn validates_and_persists_volume() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let store = Store::open(&dir)?;
+        let mut prefs = Preferences {
+            volume: 0.35,
+            ..Preferences::default()
+        };
+        store.save_preferences(&prefs)?;
+        for invalid in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
+            prefs.volume = invalid;
+            assert!(store.save_preferences(&prefs).is_err());
+        }
+        drop(store);
+        let store = Store::open(&dir)?;
+        assert_eq!(store.preferences()?.volume, 0.35);
+        store.conn.execute(
+            "UPDATE settings SET data=?1 WHERE key='preferences'",
+            [r#"{"volume":2}"#],
+        )?;
+        assert_eq!(store.preferences()?.volume, 1.0);
         drop(store);
         fs::remove_dir_all(dir)?;
         Ok(())

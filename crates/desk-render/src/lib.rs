@@ -25,6 +25,37 @@ use tokio::{
 
 const MAX_TEXT_BYTES: usize = 8_000;
 const MAX_AUDIO_BYTES: usize = 32 * 1024 * 1024;
+const MAX_EDGE_ESCAPED_BYTES: usize = 4096;
+
+/// Joins a non-empty batch after checking its total UTF-8 byte length.
+///
+/// # Errors
+/// Returns `SpeechError::InvalidText` for empty or oversized batches.
+pub fn validate_and_join_texts(texts: &[&str]) -> Result<String, SpeechError> {
+    if texts.is_empty() || texts.iter().all(|text| text.trim().is_empty()) {
+        return Err(SpeechError::InvalidText);
+    }
+    let length = texts
+        .iter()
+        .try_fold(0_usize, |sum, text| sum.checked_add(text.len()))
+        .and_then(|sum| {
+            texts
+                .len()
+                .saturating_sub(1)
+                .checked_mul(2)
+                .and_then(|separators| sum.checked_add(separators))
+        })
+        .filter(|size| *size <= MAX_TEXT_BYTES)
+        .ok_or(SpeechError::InvalidText)?;
+    let mut joined = String::with_capacity(length);
+    for (index, text) in texts.iter().enumerate() {
+        if index > 0 {
+            joined.push_str("\n\n");
+        }
+        joined.push_str(text);
+    }
+    Ok(joined)
+}
 pub const OPENROUTER_VOICE: &str = "openrouter";
 const EDGE_DMITRY: &str = "ru-RU-DmitryNeural";
 const EDGE_SVETLANA: &str = "ru-RU-SvetlanaNeural";
@@ -35,6 +66,8 @@ pub enum SpeechError {
     InvalidText,
     #[error("Скорость речи должна быть от 0,5 до 3")]
     InvalidSpeed,
+    #[error("Фрагмент слишком длинный для Edge. Разделите текст на части")]
+    EdgeTextTooLong,
     #[error("Выбранный голос недоступен: {0}")]
     UnknownVoice(String),
     #[error("Синтез речи отменён")]
@@ -139,6 +172,29 @@ impl SpeechService {
         voice: Option<&str>,
         speed: f32,
     ) -> Result<SpeechAudio, SpeechError> {
+        self.synthesize_inner(text, voice, speed, true).await
+    }
+
+    /// Synthesizes with the selected voice without switching engines.
+    ///
+    /// # Errors
+    /// Returns an error for invalid input, unavailable engines, cancellation, or timeout.
+    pub async fn synthesize_exact(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+        speed: f32,
+    ) -> Result<SpeechAudio, SpeechError> {
+        self.synthesize_inner(text, voice, speed, false).await
+    }
+
+    async fn synthesize_inner(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+        speed: f32,
+        allow_fallback: bool,
+    ) -> Result<SpeechAudio, SpeechError> {
         if text.trim().is_empty() || text.len() > MAX_TEXT_BYTES {
             return Err(SpeechError::InvalidText);
         }
@@ -146,11 +202,19 @@ impl SpeechService {
             return Err(SpeechError::InvalidSpeed);
         }
         let selected = voice.unwrap_or(EDGE_DMITRY);
+        if (selected == EDGE_DMITRY || selected == EDGE_SVETLANA)
+            && xml_escape(text).len() > MAX_EDGE_ESCAPED_BYTES
+        {
+            return Err(SpeechError::EdgeTextTooLong);
+        }
         let operation = async {
             if selected == EDGE_DMITRY || selected == EDGE_SVETLANA {
                 match edge(text, selected, speed).await {
                     Ok(audio) => Ok((audio, "audio/mpeg")),
                     Err(edge_error) => {
+                        if !allow_fallback {
+                            return Err(edge_error);
+                        }
                         if let (Some(binary), Some(model)) =
                             (self.piper_binary(), self.piper_models().into_iter().next())
                         {
@@ -194,6 +258,24 @@ impl SpeechService {
         })
     }
 
+    /// Synthesizes several texts in a single request to keep one voice and
+    /// avoid the per-line latency of a separate request for every passage.
+    /// Texts are joined with paragraph breaks; the joined text must satisfy
+    /// the same size limits as a single request.
+    ///
+    /// # Errors
+    /// Returns an error for empty or oversized batches, invalid input,
+    /// unavailable engines, cancellation, or timeout.
+    pub async fn synthesize_many(
+        &self,
+        texts: &[&str],
+        voice: Option<&str>,
+        speed: f32,
+    ) -> Result<SpeechAudio, SpeechError> {
+        let joined = validate_and_join_texts(texts)?;
+        self.synthesize(&joined, voice, speed).await
+    }
+
     /// Fetches available text-to-speech models from `OpenRouter`.
     ///
     /// # Errors
@@ -203,6 +285,28 @@ impl SpeechService {
         api_key: Option<&str>,
     ) -> Result<Vec<OpenRouterModel>, SpeechError> {
         openrouter::models(&self.openrouter_client, api_key).await
+    }
+
+    /// Validates a speech request without contacting the provider.
+    ///
+    /// # Errors
+    /// Returns an error for invalid text, speed, model, voice or credentials.
+    pub fn validate_openrouter_request(
+        &self,
+        text: &str,
+        api_key: &str,
+        model: &str,
+        voice: Option<&str>,
+        speed: f32,
+    ) -> Result<(), SpeechError> {
+        if text.trim().is_empty() || text.len() > MAX_TEXT_BYTES {
+            return Err(SpeechError::InvalidText);
+        }
+        if !speed.is_finite() || !(0.5..=3.0).contains(&speed) {
+            return Err(SpeechError::InvalidSpeed);
+        }
+        openrouter::validate_request(api_key, model, voice)?;
+        Ok(())
     }
 
     /// Synthesizes speech with the selected `OpenRouter` model.
@@ -217,8 +321,10 @@ impl SpeechService {
         voice: Option<&str>,
         speed: f32,
     ) -> Result<SpeechAudio, SpeechError> {
-        self.synthesize_openrouter(text, api_key, model, voice, speed, None)
-            .await
+        self.synthesize_openrouter(text, api_key, model, voice, speed, None, |_| async {
+            Ok(())
+        })
+        .await
     }
 
     /// Returns a cancellation marker to use when an operation starts after asynchronous preparation.
@@ -243,11 +349,51 @@ impl SpeechService {
         speed: f32,
         generation: u64,
     ) -> Result<SpeechAudio, SpeechError> {
-        self.synthesize_openrouter(text, api_key, model, voice, speed, Some(generation))
-            .await
+        self.synthesize_openrouter(
+            text,
+            api_key,
+            model,
+            voice,
+            speed,
+            Some(generation),
+            |_| async { Ok(()) },
+        )
+        .await
     }
 
-    async fn synthesize_openrouter(
+    /// Synthesizes speech and persists response metadata before reading the body.
+    ///
+    /// # Errors
+    /// Returns an error for invalid input, network or API errors, cancellation, timeout, or callback failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn synthesize_with_openrouter_tracked_if_current<F, Fut>(
+        &self,
+        text: &str,
+        api_key: &str,
+        model: &str,
+        voice: Option<&str>,
+        speed: f32,
+        generation: u64,
+        on_response: F,
+    ) -> Result<SpeechAudio, SpeechError>
+    where
+        F: FnOnce(Option<String>) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), SpeechError>> + Send,
+    {
+        self.synthesize_openrouter(
+            text,
+            api_key,
+            model,
+            voice,
+            speed,
+            Some(generation),
+            on_response,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn synthesize_openrouter<F, Fut>(
         &self,
         text: &str,
         api_key: &str,
@@ -255,16 +401,23 @@ impl SpeechService {
         voice: Option<&str>,
         speed: f32,
         generation: Option<u64>,
-    ) -> Result<SpeechAudio, SpeechError> {
-        if text.trim().is_empty() || text.len() > MAX_TEXT_BYTES {
-            return Err(SpeechError::InvalidText);
-        }
-        if !speed.is_finite() || !(0.5..=3.0).contains(&speed) {
-            return Err(SpeechError::InvalidSpeed);
-        }
+        on_response: F,
+    ) -> Result<SpeechAudio, SpeechError>
+    where
+        F: FnOnce(Option<String>) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), SpeechError>> + Send,
+    {
+        self.validate_openrouter_request(text, api_key, model, voice, speed)?;
         let (audio, mime) = self
             .run_cancellable_if_current(
-                openrouter::synthesize(&self.openrouter_client, text, api_key, model, voice),
+                openrouter::synthesize(
+                    &self.openrouter_client,
+                    text,
+                    api_key,
+                    model,
+                    voice,
+                    on_response,
+                ),
                 generation,
             )
             .await?;
@@ -423,7 +576,7 @@ where
     Fut: std::future::Future<Output = Result<Vec<u8>, EdgeFailure>>,
 {
     for index in 0..3 {
-        let result = timeout(Duration::from_secs(15), attempt()).await;
+        let result = timeout(Duration::from_secs(45), attempt()).await;
         match result {
             Ok(Ok(audio)) => return Ok(audio),
             Ok(Err(EdgeFailure::AudioTooLarge)) => {
@@ -456,8 +609,9 @@ async fn edge_once(text: &str, voice: &str, speed: f32) -> Result<Vec<u8>, EdgeF
         rate: ((speed - 1.0) * 100.0).round() as i32,
         volume: 0,
     };
-    let (mut sender, mut receiver) = msedge_tts_split_async()
+    let (mut sender, mut receiver) = timeout(Duration::from_secs(10), msedge_tts_split_async())
         .await
+        .map_err(|_| EdgeFailure::Transient("Edge не ответил при подключении."))?
         .map_err(|_| EdgeFailure::Transient("Не удалось подключиться к Edge."))?;
     sender
         .send(&xml_escape(text), &config)
@@ -465,9 +619,12 @@ async fn edge_once(text: &str, voice: &str, speed: f32) -> Result<Vec<u8>, EdgeF
         .map_err(|_| EdgeFailure::Transient("Соединение с Edge прервалось при отправке текста."))?;
     let mut audio = Vec::new();
     loop {
-        let chunk = receiver.read().await.map_err(|_| {
-            EdgeFailure::Transient("Соединение с Edge прервалось во время синтеза.")
-        })?;
+        let chunk = timeout(Duration::from_secs(15), receiver.read())
+            .await
+            .map_err(|_| EdgeFailure::Transient("Edge перестал передавать аудио."))?
+            .map_err(|_| {
+                EdgeFailure::Transient("Соединение с Edge прервалось во время синтеза.")
+            })?;
         if let Some(SynthesizedResponse::AudioBytes(bytes)) = chunk {
             if audio.len().saturating_add(bytes.len()) > MAX_AUDIO_BYTES {
                 return Err(EdgeFailure::AudioTooLarge);
@@ -594,6 +751,117 @@ mod tests {
             "&lt;&amp;&gt;&quot;&apos; \nтекст"
         );
     }
+    #[test]
+    fn validates_batch_size_including_separators() {
+        assert_eq!(
+            validate_and_join_texts(&["Первая строка.", "Вторая строка"]).unwrap(),
+            "Первая строка.\n\nВторая строка"
+        );
+        assert!(matches!(
+            validate_and_join_texts(&[]),
+            Err(SpeechError::InvalidText)
+        ));
+        let within_limit = "я".repeat(3_999);
+        let joined = validate_and_join_texts(&[&within_limit, ""]).unwrap();
+        assert_eq!(joined.len(), MAX_TEXT_BYTES);
+        assert!(matches!(
+            validate_and_join_texts(&[&within_limit, "x"]),
+            Err(SpeechError::InvalidText)
+        ));
+        assert!(matches!(
+            validate_and_join_texts(&[" ", "\t"]),
+            Err(SpeechError::InvalidText)
+        ));
+    }
+
+    #[tokio::test]
+    async fn edge_limit_counts_escaped_utf8_before_network() {
+        let service = SpeechService::new(PathBuf::new()).unwrap();
+        let text = "&".repeat(820);
+        assert_eq!(text.len(), 820);
+        assert_eq!(xml_escape(&text).len(), 4_100);
+        assert!(matches!(
+            service
+                .synthesize_many(&[&text], Some(EDGE_DMITRY), 1.0)
+                .await,
+            Err(SpeechError::EdgeTextTooLong)
+        ));
+        let text = "я".repeat(2049);
+        assert!(matches!(
+            service
+                .synthesize_many(&[&text], Some(EDGE_SVETLANA), 1.0)
+                .await,
+            Err(SpeechError::EdgeTextTooLong)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_or_oversized_batches_before_network() {
+        let service = SpeechService::new(PathBuf::new()).unwrap();
+        assert!(matches!(
+            service.synthesize_many(&[], None, 1.0).await,
+            Err(SpeechError::InvalidText)
+        ));
+        assert!(matches!(
+            service.synthesize_many(&["  ", "\n"], None, 1.0).await,
+            Err(SpeechError::InvalidText)
+        ));
+        assert!(matches!(
+            service.synthesize_many(&vec!["т"; 4_100], None, 1.0).await,
+            Err(SpeechError::InvalidText)
+        ));
+    }
+    #[tokio::test]
+    async fn accepts_valid_batch_then_checks_voice() {
+        let service = SpeechService::new(PathBuf::new()).unwrap();
+        assert!(matches!(
+            service
+                .synthesize_many(&["текст", "ещё текст"], Some("missing"), 1.0)
+                .await,
+            Err(SpeechError::UnknownVoice(_))
+        ));
+        assert!(matches!(
+            service
+                .synthesize_many(&["текст", "ещё текст"], None, f32::NAN)
+                .await,
+            Err(SpeechError::InvalidSpeed)
+        ));
+    }
+    #[test]
+    fn openrouter_preflight_validates_without_network() {
+        let service = SpeechService::new(PathBuf::new()).unwrap();
+        assert!(
+            service
+                .validate_openrouter_request("hello", "key", "provider/model", Some("voice"), 1.0)
+                .is_ok()
+        );
+        assert!(
+            service
+                .validate_openrouter_request("hello", "invalid key", "provider/model", None, 1.0)
+                .is_err()
+        );
+        assert!(
+            service
+                .validate_openrouter_request("hello", "key", "invalid model", None, 1.0)
+                .is_err()
+        );
+        assert!(
+            service
+                .validate_openrouter_request("hello", "key", "provider/model", Some("voice\n"), 1.0)
+                .is_err()
+        );
+        assert!(
+            service
+                .validate_openrouter_request(" ", "key", "provider/model", None, 1.0)
+                .is_err()
+        );
+        assert!(
+            service
+                .validate_openrouter_request("hello", "key", "provider/model", None, f32::NAN)
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn stop_invalidates_prepared_openrouter_request() {
         let service = SpeechService::new(PathBuf::new()).unwrap();
@@ -723,6 +991,26 @@ mod tests {
         .await;
         assert!(matches!(result, Err(SpeechError::Engine(_))));
         assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access to Microsoft Edge TTS"]
+    async fn edge_batch_network_smoke() {
+        let service = SpeechService::new(PathBuf::new()).unwrap();
+        let result = service
+            .synthesize_many(
+                &[
+                    "Первая строка проверяет работу пакетной озвучки.",
+                    "Вторая строка содержит знаки & кавычки и русские буквы.",
+                    "Третье предложение завершает проверку.",
+                ],
+                Some(EDGE_DMITRY),
+                1.0,
+            )
+            .await
+            .expect("Edge batch synthesis");
+        assert_eq!(result.mime, "audio/mpeg");
+        assert!(STANDARD.decode(result.data).unwrap().len() > 1000);
     }
 
     #[tokio::test]
