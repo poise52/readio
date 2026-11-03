@@ -1574,6 +1574,7 @@ mod tests {
         let modified = SystemTime::now() - std::time::Duration::from_hours(25);
         file.set_times(fs::FileTimes::new().set_modified(modified))
             .unwrap();
+        drop(file);
         cache.evict().unwrap();
         assert!(fresh.exists());
         assert!(!old.exists());
