@@ -1,11 +1,11 @@
-use crate::{Book, Error, Preferences, Result, split_passages};
-use regex::RegexBuilder;
+use crate::{Book, Chapter, Error, Preferences, Result, split_passages};
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
@@ -15,6 +15,8 @@ pub const AUDIO_BLOCK_MAX_ESCAPED_BYTES: usize = 3_000;
 pub const AUDIO_BLOCK_MAX_PASSAGES: usize = 6;
 const TRANSIENT_LIMIT: u64 = 1024 * 1024 * 1024;
 const MAX_AUDIO: usize = 32 * 1024 * 1024;
+/// Application safety limit for a lightweight offline manifest.
+pub const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -130,7 +132,7 @@ fn weight(text: &str) -> usize {
             .sum::<usize>()
 }
 
-fn prepare_units(text: &str, offset: usize, dictionary: &BTreeMap<String, String>) -> Vec<Unit> {
+fn prepare_units(text: &str, offset: usize, rules: &[(Regex, String)]) -> Vec<Unit> {
     let mut position = offset;
     let mut units: Vec<Unit> = text
         .chars()
@@ -144,17 +146,7 @@ fn prepare_units(text: &str, offset: usize, dictionary: &BTreeMap<String, String
             }
         })
         .collect();
-    for (word, replacement) in dictionary {
-        let key = word.trim();
-        if key.is_empty() {
-            continue;
-        }
-        let Ok(pattern) = RegexBuilder::new(&regex::escape(key))
-            .case_insensitive(true)
-            .build()
-        else {
-            continue;
-        };
+    for (pattern, replacement) in rules {
         let current: String = units.iter().map(|unit| unit.ch).collect();
         let mut boundaries = BTreeMap::new();
         for (index, (byte, _)) in current.char_indices().enumerate() {
@@ -237,75 +229,132 @@ fn finish_block(
     texts.clear();
 }
 
-#[must_use]
-pub fn plan_chapter(book: &Book, chapter: usize, profile: &AudioProfile) -> Vec<AudioBlock> {
-    let Some(source) = book.chapters.get(chapter) else {
-        return Vec::new();
-    };
-    let limit = profile.escaped_byte_limit();
-    let mut blocks = Vec::new();
-    let mut parts = Vec::new();
-    let mut texts = Vec::new();
-    let mut bytes = 0;
-    for (index, passage) in split_passages(&source.text).iter().enumerate() {
-        let units = prepare_units(&passage.text, passage.start, &profile.dictionary);
-        let mut current = String::new();
-        let mut start = 0;
-        let mut end = 0;
-        for unit in units {
-            let separator = if current.is_empty() && !parts.is_empty() {
-                2
-            } else {
-                0
-            };
-            let size = escaped_size(unit.ch);
-            if bytes + separator + size > limit
-                || current.is_empty() && parts.len() >= AUDIO_BLOCK_MAX_PASSAGES
-            {
-                if !current.is_empty() {
-                    parts.push(AudioPart {
-                        index,
-                        start,
-                        end,
-                        weight: weight(&current),
-                    });
-                    texts.push(std::mem::take(&mut current));
+#[derive(Debug, Clone)]
+pub struct ChapterPlanner {
+    profile: AudioProfile,
+    rules: Vec<(Regex, String)>,
+}
+
+impl ChapterPlanner {
+    #[must_use]
+    pub fn new(profile: &AudioProfile) -> Self {
+        let rules = profile
+            .dictionary
+            .iter()
+            .filter_map(|(word, replacement)| {
+                let key = word.trim();
+                if key.is_empty() {
+                    return None;
                 }
-                finish_block(&mut blocks, chapter, profile, &mut parts, &mut texts);
-                bytes = 0;
-            }
-            if current.is_empty() {
-                if !parts.is_empty() {
-                    bytes += 2;
-                }
-                start = unit.start;
-            }
-            bytes += size;
-            end = unit.end;
-            current.push(unit.ch);
-        }
-        if !current.is_empty() {
-            parts.push(AudioPart {
-                index,
-                start,
-                end,
-                weight: weight(&current),
-            });
-            texts.push(current);
+                RegexBuilder::new(&regex::escape(key))
+                    .case_insensitive(true)
+                    .build()
+                    .ok()
+                    .map(|pattern| (pattern, replacement.clone()))
+            })
+            .collect();
+        Self {
+            profile: profile.clone(),
+            rules,
         }
     }
-    finish_block(&mut blocks, chapter, profile, &mut parts, &mut texts);
-    blocks.retain(|block| block.text.chars().any(char::is_alphanumeric));
-    blocks
+
+    #[must_use]
+    pub fn plan_chapter(&self, chapter: usize, source: &Chapter) -> Vec<AudioBlock> {
+        self.plan_text(chapter, &source.text)
+    }
+
+    #[must_use]
+    pub fn plan_book(&self, book: &Book) -> Vec<AudioBlock> {
+        book.chapters
+            .iter()
+            .enumerate()
+            .flat_map(|(chapter, source)| self.plan_chapter(chapter, source))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn plan_text(&self, chapter: usize, text: &str) -> Vec<AudioBlock> {
+        self.plan_v1_text(chapter, text)
+    }
+
+    // Keep this algorithm frozen for editions created before planner versioning.
+    fn plan_v1_text(&self, chapter: usize, text: &str) -> Vec<AudioBlock> {
+        let limit = self.profile.escaped_byte_limit();
+        let mut blocks = Vec::new();
+        let mut parts = Vec::new();
+        let mut texts = Vec::new();
+        let mut bytes = 0;
+        for (index, passage) in split_passages(text).iter().enumerate() {
+            let units = prepare_units(&passage.text, passage.start, &self.rules);
+            let mut current = String::new();
+            let mut start = 0;
+            let mut end = 0;
+            for unit in units {
+                let separator = if current.is_empty() && !parts.is_empty() {
+                    2
+                } else {
+                    0
+                };
+                let size = escaped_size(unit.ch);
+                if bytes + separator + size > limit
+                    || current.is_empty() && parts.len() >= AUDIO_BLOCK_MAX_PASSAGES
+                {
+                    if !current.is_empty() {
+                        parts.push(AudioPart {
+                            index,
+                            start,
+                            end,
+                            weight: weight(&current),
+                        });
+                        texts.push(std::mem::take(&mut current));
+                    }
+                    finish_block(&mut blocks, chapter, &self.profile, &mut parts, &mut texts);
+                    bytes = 0;
+                }
+                if current.is_empty() {
+                    if !parts.is_empty() {
+                        bytes += 2;
+                    }
+                    start = unit.start;
+                }
+                bytes += size;
+                end = unit.end;
+                current.push(unit.ch);
+            }
+            if !current.is_empty() {
+                parts.push(AudioPart {
+                    index,
+                    start,
+                    end,
+                    weight: weight(&current),
+                });
+                texts.push(current);
+            }
+        }
+        finish_block(&mut blocks, chapter, &self.profile, &mut parts, &mut texts);
+        blocks.retain(|block| block.text.chars().any(char::is_alphanumeric));
+        blocks
+    }
+}
+
+/// The v1 planner preserves the IDs and offsets used by legacy offline editions.
+#[must_use]
+pub fn plan_chapter_v1(book: &Book, chapter: usize, profile: &AudioProfile) -> Vec<AudioBlock> {
+    book.chapters.get(chapter).map_or_else(Vec::new, |source| {
+        ChapterPlanner::new(profile).plan_v1_text(chapter, &source.text)
+    })
+}
+
+#[must_use]
+pub fn plan_chapter(book: &Book, chapter: usize, profile: &AudioProfile) -> Vec<AudioBlock> {
+    plan_chapter_v1(book, chapter, profile)
 }
 
 #[must_use]
 pub fn plan_book(book: &Book, profile: &AudioProfile) -> Vec<AudioBlock> {
-    (0..book.chapters.len())
-        .flat_map(|chapter| plan_chapter(book, chapter, profile))
-        .collect()
+    ChapterPlanner::new(profile).plan_book(book)
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfflineManifest {
@@ -314,8 +363,26 @@ pub struct OfflineManifest {
     pub profile: AudioProfile,
     pub block_ids: Vec<String>,
     #[serde(default)]
+    pub plan_digest: Option<String>,
+    #[serde(default)]
     pub updated_at: u64,
 }
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestIssue {
+    pub file: String,
+    pub book_id: Option<String>,
+    pub profile_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestReport {
+    pub manifests: Vec<OfflineManifest>,
+    pub issues: Vec<ManifestIssue>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CachedAudio {
@@ -339,6 +406,7 @@ struct CacheEntry {
 struct CacheIndex {
     entries: HashMap<String, CacheEntry>,
     manifest_pins: HashSet<String>,
+    eviction_blocked: bool,
     transient: u64,
     manifests_modified: Option<SystemTime>,
     blocks_modified: Option<SystemTime>,
@@ -406,6 +474,23 @@ fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() > limit as u64 {
+        return Err(Error::Format(
+            "Файл превышает допустимый размер приложения".into(),
+        ));
+    }
+    let mut data = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut data)?;
+    if data.len() > limit {
+        return Err(Error::Format(
+            "Файл превышает допустимый размер приложения".into(),
+        ));
+    }
+    Ok(data)
+}
+
 fn stale(path: &Path) -> bool {
     fs::metadata(path)
         .and_then(|info| info.modified())
@@ -428,6 +513,7 @@ impl AudioCache {
         let root = data_dir.join("audio-cache");
         fs::create_dir_all(root.join("blocks"))?;
         fs::create_dir_all(root.join("manifests"))?;
+        fs::create_dir_all(root.join("editions"))?;
         Ok(Self {
             root,
             transient_limit: TRANSIENT_LIMIT,
@@ -656,39 +742,173 @@ impl AudioCache {
         })
     }
 
+    /// Stores an immutable content-addressed edition plan.
+    ///
+    /// # Errors
+    /// Returns an error if the plan is oversized or the file cannot be written.
+    pub fn save_edition_plan(&self, plan: &crate::EditionPlan) -> Result<String> {
+        let (bytes, digest) = plan.encode()?;
+        let _guard = self.lock();
+        let path = self.root.join("editions").join(format!("{digest}.json"));
+        match read_bounded(&path, crate::MAX_EDITION_PLAN_BYTES) {
+            Ok(existing) if existing == bytes => return Ok(digest),
+            Ok(_) => return Err(Error::Format("Повреждён файл плана издания".into())),
+            Err(Error::Io(error)) if error.kind() == ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
+        atomic_write(&path, &bytes)?;
+        Ok(digest)
+    }
+
+    /// Loads and verifies a content-addressed edition plan.
+    ///
+    /// # Errors
+    /// Returns an error if the plan is missing, oversized, corrupt or has an unsupported version.
+    pub fn edition_plan(&self, digest: &str) -> Result<crate::EditionPlan> {
+        validate_id(digest)?;
+        let _guard = self.lock();
+        let bytes = read_bounded(
+            &self.root.join("editions").join(format!("{digest}.json")),
+            crate::MAX_EDITION_PLAN_BYTES,
+        )?;
+        crate::EditionPlan::decode(&bytes, digest)
+    }
+
+    fn parse_manifest(&self, path: &Path, bytes: &[u8]) -> Result<OfflineManifest> {
+        let manifest: OfflineManifest = serde_json::from_slice(bytes)?;
+        validate_manifest(&manifest)?;
+        if path.file_name()
+            != self
+                .manifest_path(&manifest.book_id, &manifest.profile_id)
+                .file_name()
+        {
+            return Err(Error::Format(
+                "Имя файла манифеста не соответствует изданию".into(),
+            ));
+        }
+        Ok(manifest)
+    }
+
+    fn scan_manifests_locked(&self) -> Result<ManifestReport> {
+        let mut report = ManifestReport {
+            manifests: Vec::new(),
+            issues: Vec::new(),
+        };
+        for entry in fs::read_dir(self.root.join("manifests"))? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let file = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let bytes = read_bounded(&path, MAX_MANIFEST_BYTES);
+            let parsed = bytes
+                .as_ref()
+                .map_err(std::string::ToString::to_string)
+                .and_then(|bytes| {
+                    self.parse_manifest(&path, bytes)
+                        .map_err(|error| error.to_string())
+                });
+            match parsed {
+                Ok(manifest) => report.manifests.push(manifest),
+                Err(message) => {
+                    let identity = bytes
+                        .ok()
+                        .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok());
+                    let book_id = identity
+                        .as_ref()
+                        .and_then(|value| value.get("bookId"))
+                        .and_then(|value| value.as_str())
+                        .filter(|id| {
+                            !id.is_empty() && id.len() <= 4096 && !id.chars().any(char::is_control)
+                        })
+                        .map(str::to_owned);
+                    let profile_id = identity
+                        .as_ref()
+                        .and_then(|value| value.get("profileId"))
+                        .and_then(|value| value.as_str())
+                        .filter(|id| valid_id(id))
+                        .map(str::to_owned);
+                    report.issues.push(ManifestIssue {
+                        file,
+                        book_id,
+                        profile_id,
+                        message,
+                    });
+                }
+            }
+        }
+        report.manifests.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.book_id.cmp(&right.book_id))
+                .then_with(|| left.profile_id.cmp(&right.profile_id))
+        });
+        report.issues.sort_by(|a, b| a.file.cmp(&b.file));
+        Ok(report)
+    }
+
+    /// Lists healthy manifests and diagnostics for damaged files.
+    ///
+    /// # Errors
+    /// Returns an error if the manifest directory cannot be enumerated.
+    pub fn scan_manifests(&self) -> Result<ManifestReport> {
+        let _guard = self.lock();
+        self.scan_manifests_locked()
+    }
+
+    /// Lists healthy persisted offline manifests, newest first.
+    ///
+    /// # Errors
+    /// Returns an error if the manifest directory cannot be enumerated.
+    pub fn list_manifests(&self) -> Result<Vec<OfflineManifest>> {
+        Ok(self.scan_manifests()?.manifests)
+    }
+
     /// Loads an offline manifest.
     ///
     /// # Errors
-    /// Returns an error for invalid profile IDs or filesystem failures.
+    /// Returns an error for a malformed manifest, invalid identifier or filesystem failure.
     pub fn manifest(&self, book_id: &str, profile_id: &str) -> Result<Option<OfflineManifest>> {
         validate_id(profile_id)?;
         let _guard = self.lock();
-        let data = match fs::read(self.manifest_path(book_id, profile_id)) {
+        let path = self.manifest_path(book_id, profile_id);
+        let data = match read_bounded(&path, MAX_MANIFEST_BYTES) {
             Ok(data) => data,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(Error::Io(error)) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
         };
-        let value: OfflineManifest = serde_json::from_slice(&data)?;
-        validate_manifest(&value)?;
-        if value.book_id != book_id || value.profile_id != profile_id {
-            return Err(Error::Format("Повреждён манифест аудио".into()));
-        }
-        Ok(Some(value))
+        Ok(Some(self.parse_manifest(&path, &data)?))
     }
 
     /// Atomically stores an offline manifest and pins every referenced block.
     ///
     /// # Errors
-    /// Returns an error for an invalid manifest or filesystem failure.
+    /// Returns an error for an invalid manifest, damaged existing manifest or filesystem failure.
     pub fn save_manifest(&self, manifest: &OfflineManifest) -> Result<()> {
         validate_manifest(manifest)?;
         let _guard = self.lock();
+        let path = self.manifest_path(&manifest.book_id, &manifest.profile_id);
+        match read_bounded(&path, MAX_MANIFEST_BYTES) {
+            Ok(bytes) => {
+                self.parse_manifest(&path, &bytes)?;
+            }
+            Err(Error::Io(error)) if error.kind() == ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
         let mut persisted = manifest.clone();
         persisted.updated_at = timestamp();
-        atomic_write(
-            &self.manifest_path(&manifest.book_id, &manifest.profile_id),
-            &serde_json::to_vec(&persisted)?,
-        )?;
+        let bytes = serde_json::to_vec(&persisted)?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(Error::Format(
+                "Манифест превышает допустимый размер приложения".into(),
+            ));
+        }
+        atomic_write(&path, &bytes)?;
         *self
             .index
             .lock()
@@ -696,73 +916,104 @@ impl AudioCache {
         Ok(())
     }
 
-    /// Lists persisted offline manifests, newest first.
+    /// Restores a corrupt manifest from a matching validated backup.
     ///
     /// # Errors
-    /// Returns an error if a manifest is invalid or inaccessible.
-    pub fn list_manifests(&self) -> Result<Vec<OfflineManifest>> {
+    /// Returns an error for invalid paths, a healthy or absent target, invalid backup or filesystem failure.
+    pub fn restore_manifest(&self, issue_file: &str, backup: &Path) -> Result<()> {
+        let Some(id) = issue_file.strip_suffix(".json") else {
+            return Err(Error::Format("Некорректное имя манифеста".into()));
+        };
+        validate_id(id)?;
         let _guard = self.lock();
-        let mut manifests = Vec::new();
-        for entry in fs::read_dir(self.root.join("manifests"))? {
-            let path = entry?.path();
-            if path.extension().is_none_or(|extension| extension != "json") {
-                continue;
-            }
-            let manifest: OfflineManifest = serde_json::from_slice(&fs::read(path)?)?;
-            validate_manifest(&manifest)?;
-            manifests.push(manifest);
+        let target = self.root.join("manifests").join(issue_file);
+        let issues = self.scan_manifests_locked()?.issues;
+        if !issues.iter().any(|issue| issue.file == issue_file) {
+            return Err(Error::Format("Повреждённый манифест не найден".into()));
         }
-        manifests.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| left.book_id.cmp(&right.book_id))
-                .then_with(|| left.profile_id.cmp(&right.profile_id))
-        });
-        Ok(manifests)
+        let bytes = read_bounded(backup, MAX_MANIFEST_BYTES)?;
+        self.parse_manifest(&target, &bytes)?;
+        atomic_write(&target, &bytes)?;
+        *self
+            .index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        Ok(())
     }
 
     /// Removes an offline manifest and releases its pins.
     ///
     /// # Errors
-    /// Returns an error for an invalid profile ID or filesystem failure.
+    /// Returns an error for an invalid, damaged or inaccessible manifest.
     pub fn remove_manifest(&self, book_id: &str, profile_id: &str) -> Result<()> {
         validate_id(profile_id)?;
         let _guard = self.lock();
-        match fs::remove_file(self.manifest_path(book_id, profile_id)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        let path = self.manifest_path(book_id, profile_id);
+        let digest = match read_bounded(&path, MAX_MANIFEST_BYTES) {
+            Ok(bytes) => {
+                let manifest = self.parse_manifest(&path, &bytes)?;
+                fs::remove_file(path)?;
+                manifest.plan_digest
+            }
+            Err(Error::Io(error)) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         *self
             .index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.remove_unreferenced_plans_locked(digest.into_iter().collect())?;
         self.evict_locked()
     }
 
-    /// Removes every offline edition belonging to a book.
+    /// Removes readable offline editions belonging to a book, preserving damaged files.
     ///
     /// # Errors
-    /// Returns an error if manifests cannot be read or removed.
+    /// Returns an error if manifests cannot be enumerated or removed.
     pub fn remove_book_manifests(&self, book_id: &str) -> Result<()> {
         let _guard = self.lock();
-        for entry in fs::read_dir(self.root.join("manifests"))? {
-            let path = entry?.path();
-            if path.extension().is_none_or(|extension| extension != "json") {
-                continue;
-            }
-            let manifest: OfflineManifest = serde_json::from_slice(&fs::read(&path)?)?;
-            validate_manifest(&manifest)?;
+        let mut digests = HashSet::new();
+        for manifest in self.scan_manifests_locked()?.manifests {
             if manifest.book_id == book_id {
-                fs::remove_file(path)?;
+                fs::remove_file(self.manifest_path(&manifest.book_id, &manifest.profile_id))?;
+                if let Some(digest) = manifest.plan_digest {
+                    digests.insert(digest);
+                }
             }
         }
         *self
             .index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.remove_unreferenced_plans_locked(digests)?;
         self.evict_locked()
+    }
+
+    fn remove_unreferenced_plans_locked(&self, digests: HashSet<String>) -> Result<()> {
+        if digests.is_empty() {
+            return Ok(());
+        }
+        let report = self.scan_manifests_locked()?;
+        if !report.issues.is_empty() {
+            return Ok(());
+        }
+        let referenced: HashSet<_> = report
+            .manifests
+            .iter()
+            .filter_map(|manifest| manifest.plan_digest.as_deref())
+            .collect();
+        for digest in digests {
+            if referenced.contains(digest.as_str()) {
+                continue;
+            }
+            let path = self.root.join("editions").join(format!("{digest}.json"));
+            match fs::remove_file(&path) {
+                Ok(()) => sync_parent_directory(&path)?,
+                Err(error) if error.kind() == ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     /// Pins an active playback block until it is released.
@@ -838,8 +1089,17 @@ impl AudioCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let manifests_modified = directory_stamp(&self.root.join("manifests"))?;
         let blocks_modified = directory_stamp(&self.root.join("blocks"))?;
+        let report = self.scan_manifests_locked()?;
+        let current_pins: HashSet<String> = report
+            .manifests
+            .iter()
+            .flat_map(|manifest| manifest.block_ids.iter().cloned())
+            .collect();
+        let eviction_blocked = !report.issues.is_empty();
         let needs_scan = guard.as_ref().is_none_or(|index| {
-            manifests_modified.is_none()
+            index.eviction_blocked != eviction_blocked
+                || index.manifest_pins != current_pins
+                || manifests_modified.is_none()
                 || blocks_modified.is_none()
                 || index.manifests_modified != manifests_modified
                 || index.blocks_modified != blocks_modified
@@ -858,18 +1118,15 @@ impl AudioCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut pinned: HashSet<String> = active.keys().cloned().collect();
         let mut manifest_pins = HashSet::new();
+        let report = self.scan_manifests_locked()?;
+        let eviction_blocked = !report.issues.is_empty();
         for entry in fs::read_dir(self.root.join("manifests"))? {
             let path = entry?.path();
-            if path.extension().is_some_and(|extension| extension == "tmp") && stale(&path) {
+            if path.extension().is_some_and(|ext| ext == "tmp") && stale(&path) {
                 fs::remove_file(path)?;
-                continue;
             }
-            if path.extension().is_none_or(|extension| extension != "json") {
-                continue;
-            }
-            let data = fs::read(path)?;
-            let manifest: OfflineManifest = serde_json::from_slice(&data)?;
-            validate_manifest(&manifest)?;
+        }
+        for manifest in report.manifests {
             pinned.extend(manifest.block_ids.iter().cloned());
             manifest_pins.extend(manifest.block_ids);
         }
@@ -887,7 +1144,8 @@ impl AudioCache {
                 let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
                     continue;
                 };
-                if valid_id(id) && !self.paths(id).1.is_file() && stale(&path) {
+                if !eviction_blocked && valid_id(id) && !self.paths(id).1.is_file() && stale(&path)
+                {
                     fs::remove_file(path)?;
                 }
             }
@@ -909,7 +1167,9 @@ impl AudioCache {
             let size = match fs::metadata(&audio) {
                 Ok(info) => info.len(),
                 Err(error) if error.kind() == ErrorKind::NotFound => {
-                    fs::remove_file(path)?;
+                    if !eviction_blocked {
+                        fs::remove_file(path)?;
+                    }
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -926,7 +1186,7 @@ impl AudioCache {
                     && valid_id(&metadata.digest)
                     && valid_mime(&metadata.mime)
             }) else {
-                if !pinned.contains(id) {
+                if !eviction_blocked && !pinned.contains(id) {
                     fs::remove_file(audio)?;
                     fs::remove_file(path)?;
                 }
@@ -946,6 +1206,7 @@ impl AudioCache {
         Ok(CacheIndex {
             entries,
             manifest_pins,
+            eviction_blocked,
             transient: total,
             manifests_modified: directory_stamp(&self.root.join("manifests"))?,
             blocks_modified: directory_stamp(&self.root.join("blocks"))?,
@@ -966,7 +1227,7 @@ impl AudioCache {
         let Some(index) = guard.as_mut() else {
             return Ok(());
         };
-        if index.transient <= self.transient_limit {
+        if index.eviction_blocked || index.transient <= self.transient_limit {
             return Ok(());
         }
         let mut candidates: Vec<_> = index
@@ -1002,6 +1263,12 @@ fn valid_mime(mime: &str) -> bool {
 }
 fn validate_manifest(manifest: &OfflineManifest) -> Result<()> {
     if manifest.book_id.is_empty()
+        || manifest.book_id.len() > 4096
+        || manifest.book_id.chars().any(char::is_control)
+        || manifest
+            .plan_digest
+            .as_deref()
+            .is_some_and(|digest| !valid_id(digest))
         || manifest.profile_id != manifest.profile.id()
         || manifest.block_ids.iter().any(|id| !valid_id(id))
     {
@@ -1105,6 +1372,7 @@ mod tests {
             profile_id: profile.id(),
             profile,
             block_ids: vec![id.clone()],
+            plan_digest: None,
             updated_at: 0,
         };
         let cache = AudioCache::new(root.clone()).unwrap();
@@ -1140,6 +1408,159 @@ mod tests {
             .remove_manifest(&manifest.book_id, &manifest.profile_id)
             .unwrap();
         assert!(cache.list_manifests().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn damaged_manifest_isolated_and_blocks_eviction_until_restored() {
+        let root = fixture();
+        let mut cache = AudioCache::new(root.clone()).unwrap();
+        let profile = AudioProfile::from_preferences(&Preferences::default());
+        let ids: Vec<String> = (1..=4).map(|n| format!("{n:064x}")).collect();
+        let manifests: Vec<_> = (0..3)
+            .map(|n| OfflineManifest {
+                book_id: format!("book-{n}"),
+                profile_id: profile.id(),
+                profile: profile.clone(),
+                block_ids: vec![ids[n].clone()],
+                plan_digest: None,
+                updated_at: 0,
+            })
+            .collect();
+        for (n, manifest) in manifests.iter().enumerate() {
+            cache.save_manifest(manifest).unwrap();
+            cache.put(&ids[n], "audio/mpeg", b"sound").unwrap();
+        }
+        let bad_path = cache.manifest_path(&manifests[1].book_id, &manifests[1].profile_id);
+        let backup = root.join("backup.json");
+        fs::copy(&bad_path, &backup).unwrap();
+        fs::write(&bad_path, b"broken json").unwrap();
+        let report = cache.scan_manifests().unwrap();
+        assert_eq!(report.manifests.len(), 2);
+        assert_eq!(report.issues.len(), 1);
+        assert!(report.issues[0].book_id.is_none());
+        cache.transient_limit = 0;
+        cache.put(&ids[3], "audio/mpeg", b"transient").unwrap();
+        for id in &ids {
+            assert!(cache.verify(id).unwrap().is_some());
+        }
+        assert!(cache.save_manifest(&manifests[1]).is_err());
+        let filename = bad_path.file_name().unwrap().to_str().unwrap();
+        assert!(cache.restore_manifest("../backup.json", &backup).is_err());
+        cache.restore_manifest(filename, &backup).unwrap();
+        assert!(cache.scan_manifests().unwrap().issues.is_empty());
+        cache.evict().unwrap();
+        for id in &ids[..3] {
+            assert!(cache.verify(id).unwrap().is_some());
+        }
+        assert!(cache.verify(&ids[3]).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_and_wrong_filename_manifest_are_isolated() {
+        let root = fixture();
+        let cache = AudioCache::new(root.clone()).unwrap();
+        let profile = AudioProfile::from_preferences(&Preferences::default());
+        let manifest = OfflineManifest {
+            book_id: "valid".into(),
+            profile_id: profile.id(),
+            profile,
+            block_ids: Vec::new(),
+            plan_digest: None,
+            updated_at: 0,
+        };
+        cache.save_manifest(&manifest).unwrap();
+        let wrong = cache
+            .root
+            .join("manifests")
+            .join(format!("{}.json", "a".repeat(64)));
+        fs::write(&wrong, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let oversized = cache
+            .root
+            .join("manifests")
+            .join(format!("{}.json", "b".repeat(64)));
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_MANIFEST_BYTES as u64 + 1)
+            .unwrap();
+        let report = cache.scan_manifests().unwrap();
+        assert_eq!(report.manifests.len(), 1);
+        assert_eq!(report.issues.len(), 2);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.book_id.as_deref() == Some("valid"))
+        );
+        assert!(
+            cache
+                .restore_manifest(wrong.file_name().unwrap().to_str().unwrap(), &wrong)
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persists_and_verifies_content_addressed_plan() {
+        let root = fixture();
+        let cache = AudioCache::new(root.clone()).unwrap();
+        let book = book("Первое предложение. Второе предложение.");
+        let profile = AudioProfile::from_preferences(&Preferences::default());
+        let plan = crate::EditionPlan::build(&book, &profile).unwrap();
+        let digest = cache.save_edition_plan(&plan).unwrap();
+        assert_eq!(cache.save_edition_plan(&plan).unwrap(), digest);
+        let loaded = cache.edition_plan(&digest).unwrap();
+        loaded.validate(&book, &profile).unwrap();
+        assert_eq!(loaded.block_ids(), plan.block_ids());
+        fs::write(
+            cache.root.join("editions").join(format!("{digest}.json")),
+            b"bad",
+        )
+        .unwrap();
+        assert!(cache.edition_plan(&digest).is_err());
+        assert!(cache.save_edition_plan(&plan).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plan_cleanup_preserves_shared_and_unknown_references() {
+        let root = fixture();
+        let cache = AudioCache::new(root.clone()).unwrap();
+        let source = book("Текст первой главы.");
+        let profile = AudioProfile::from_preferences(&Preferences::default());
+        let plan = crate::EditionPlan::build(&source, &profile).unwrap();
+        let digest = cache.save_edition_plan(&plan).unwrap();
+        let plan_path = cache.root.join("editions").join(format!("{digest}.json"));
+        let first = OfflineManifest {
+            book_id: "first".into(),
+            profile_id: profile.id(),
+            profile: profile.clone(),
+            block_ids: plan.block_ids(),
+            plan_digest: Some(digest.clone()),
+            updated_at: 0,
+        };
+        let second = OfflineManifest {
+            book_id: "second".into(),
+            ..first.clone()
+        };
+        cache.save_manifest(&first).unwrap();
+        cache.save_manifest(&second).unwrap();
+        cache
+            .remove_manifest(&first.book_id, &first.profile_id)
+            .unwrap();
+        assert!(plan_path.exists());
+        let unknown = cache
+            .root
+            .join("manifests")
+            .join(format!("{}.json", "b".repeat(64)));
+        fs::write(&unknown, b"not json").unwrap();
+        cache.remove_book_manifests(&second.book_id).unwrap();
+        assert!(plan_path.exists());
+        fs::remove_file(unknown).unwrap();
+        cache.save_manifest(&first).unwrap();
+        cache.remove_book_manifests(&first.book_id).unwrap();
+        assert!(!plan_path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1194,6 +1615,7 @@ mod tests {
                 profile_id: profile.id(),
                 profile,
                 block_ids: vec![pinned.clone()],
+                plan_digest: None,
                 updated_at: 0,
             })
             .unwrap();
@@ -1246,6 +1668,7 @@ mod tests {
             profile_id: profile.id(),
             profile,
             block_ids: vec![ids[0].clone()],
+            plan_digest: None,
             updated_at: 0,
         };
         cache.save_manifest(&manifest).unwrap();

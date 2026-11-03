@@ -65,6 +65,25 @@ pub struct BookSummary {
     pub progress: f64,
 }
 #[derive(Clone, Debug, Serialize)]
+pub struct ChapterSummary {
+    pub title: String,
+    pub length: usize,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ReaderBook {
+    pub id: String,
+    pub title: String,
+    pub author: String,
+    pub cover: Option<String>,
+    pub chapters: Vec<ChapterSummary>,
+    pub chapter: usize,
+    pub offset: usize,
+    pub speed: f32,
+    pub marks: Vec<Mark>,
+    pub passages: Vec<Passage>,
+    pub progress: f64,
+}
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BookmarkEntry {
     pub book: BookSummary,

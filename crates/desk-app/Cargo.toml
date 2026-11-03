@@ -13,6 +13,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+rusqlite.workspace = true
+
 [dependencies]
 desk-core = { path = "../desk-core", version = "0.1.0" }
 readio-speech = { path = "../desk-render", version = "0.1.0" }
@@ -29,6 +33,3 @@ keyring.workspace = true
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-rusqlite.workspace = true

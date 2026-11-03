@@ -1,4 +1,7 @@
-use crate::{Book, BookSummary, Chapter, Error, Mark, Preferences, Result, import_book};
+use crate::{
+    Book, BookSummary, Chapter, ChapterSummary, Error, Mark, Preferences, ReaderBook, Result,
+    import_book, split_passages,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::{
     fs,
@@ -171,6 +174,95 @@ impl Store {
             .collect::<std::result::Result<_, _>>()?;
         book.refresh();
         Ok(book)
+    }
+    /// Reads reader metadata and the current chapter without loading other chapter texts.
+    ///
+    /// # Errors
+    /// Returns an error if the book is absent or its data cannot be read.
+    pub fn reader_book(&self, id: &str) -> Result<ReaderBook> {
+        let mut book = self
+            .conn
+            .query_row(
+                "SELECT id,title,author,cover,chapter,offset,speed FROM books WHERE id=?1",
+                [id],
+                |r| {
+                    Ok(ReaderBook {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        author: r.get(2)?,
+                        cover: r.get(3)?,
+                        chapters: Vec::new(),
+                        chapter: r.get(4)?,
+                        offset: r.get(5)?,
+                        speed: r.get(6)?,
+                        marks: Vec::new(),
+                        passages: Vec::new(),
+                        progress: 0.0,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(Error::NotFound)?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT title,length FROM chapters WHERE book_id=?1 ORDER BY idx")?;
+        book.chapters = stmt
+            .query_map([id], |r| {
+                Ok(ChapterSummary {
+                    title: r.get(0)?,
+                    length: r.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id,chapter,offset,excerpt FROM marks WHERE book_id=?1 ORDER BY rowid",
+        )?;
+        book.marks = stmt
+            .query_map([id], |r| {
+                Ok(Mark {
+                    id: r.get(0)?,
+                    chapter: r.get(1)?,
+                    offset: r.get(2)?,
+                    excerpt: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        book.chapter = book.chapter.min(book.chapters.len().saturating_sub(1));
+        let total: usize = book.chapters.iter().map(|chapter| chapter.length).sum();
+        let done: usize = book
+            .chapters
+            .iter()
+            .take(book.chapter)
+            .map(|chapter| chapter.length)
+            .sum();
+        if let Some(current) = book.chapters.get(book.chapter) {
+            book.offset = book.offset.min(current.length);
+            book.passages = split_passages(&self.chapter(id, book.chapter)?.text);
+        } else {
+            book.offset = 0;
+        }
+        book.progress = if total == 0 {
+            0.0
+        } else {
+            f64::from(u32::try_from(done + book.offset).unwrap_or(u32::MAX))
+                / f64::from(u32::try_from(total).unwrap_or(u32::MAX))
+        };
+        Ok(book)
+    }
+    /// Reads one chapter and distinguishes a missing book from a missing chapter.
+    ///
+    /// # Errors
+    /// Returns an error if the book or chapter is absent or cannot be read.
+    pub fn chapter(&self, id: &str, index: usize) -> Result<Chapter> {
+        let row = self.conn.query_row(
+            "SELECT c.title,c.text FROM books b LEFT JOIN chapters c ON c.book_id=b.id AND c.idx=?2 WHERE b.id=?1",
+            params![id, index],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+        ).optional()?.ok_or(Error::NotFound)?;
+        match row {
+            (Some(title), Some(text)) => Ok(Chapter { title, text }),
+            _ => Err(Error::Format("Глава не найдена".into())),
+        }
     }
     /// # Errors
     /// Returns an error if a book cannot be parsed or stored.
@@ -496,6 +588,74 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reader_only_contains_current_chapter_and_uses_utf16_lengths()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let store = Store::open(&dir)?;
+        let other_text = "SECRET_OTHER_CHAPTER".repeat(100_000);
+        let mut book = Book {
+            id: "reader-test".into(),
+            title: "Test".into(),
+            author: "Author".into(),
+            chapter: 1,
+            offset: 2,
+            chapters: vec![
+                Chapter {
+                    title: "Other".into(),
+                    text: other_text,
+                },
+                Chapter {
+                    title: "Current".into(),
+                    text: "😀 Привет. Мир!".into(),
+                },
+                Chapter {
+                    title: "Last".into(),
+                    text: "Финал 😀".into(),
+                },
+            ],
+            ..Book::default()
+        };
+        book.refresh();
+        store.import_parsed(&[book])?;
+        let mark = store.add_mark("reader-test", 1, 3)?;
+        let reader = store.reader_book("reader-test")?;
+        let full = store.book("reader-test")?;
+        assert_eq!((reader.chapter, reader.offset), (1, 2));
+        assert_eq!(reader.marks[0].id, mark.id);
+        assert_eq!(
+            reader.chapters[1].length,
+            "😀 Привет. Мир!".encode_utf16().count()
+        );
+        assert_eq!(reader.chapters[2].length, "Финал 😀".encode_utf16().count());
+        assert_eq!(
+            reader
+                .passages
+                .iter()
+                .map(|p| (p.start, p.end, &p.text))
+                .collect::<Vec<_>>(),
+            full.passages
+                .iter()
+                .map(|p| (p.start, p.end, &p.text))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reader.progress, full.progress);
+        let json = serde_json::to_string(&reader)?;
+        assert!(!json.contains("SECRET_OTHER_CHAPTER"));
+        assert!(!json.contains("Финал 😀"));
+        assert!(json.contains("Привет"));
+        assert!(json.len() < 1024);
+        assert_eq!(store.chapter("reader-test", 2)?.text, "Финал 😀");
+        assert!(matches!(
+            store.chapter("reader-test", 3),
+            Err(Error::Format(_))
+        ));
+        assert!(matches!(store.chapter("missing", 0), Err(Error::NotFound)));
+        assert!(matches!(store.reader_book("missing"), Err(Error::NotFound)));
+        drop(store);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     #[test]
     fn migrates_backups_and_clamps_positions() -> std::result::Result<(), Box<dyn std::error::Error>>
     {

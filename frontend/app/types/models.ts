@@ -10,7 +10,7 @@ export interface BookSummary {
 }
 export interface Chapter {
   title: string;
-  text: string;
+  length: number;
 }
 export interface Mark {
   id: string;
@@ -87,7 +87,7 @@ export interface AudioBlock {
   start: number;
   end: number;
   passages: AudioPart[];
-  text: string;
+  text?: string;
   characters: number;
 }
 export interface AudioPlan {
@@ -129,4 +129,11 @@ export interface OfflineQuote {
   billableUnits: number | null;
   costUnit: "free" | "unknown" | "character" | "utf8_byte";
   expiresAt: number;
+}
+
+export interface OfflineDiagnostic {
+  file: string;
+  bookId: string | null;
+  profileId: string | null;
+  message: string;
 }

@@ -1,13 +1,14 @@
 use crate::{AppState, IpcResult, credentials};
 use crate::{
     block_error::{BlockError, BlockErrorCode, BlockResult},
+    plan_cache::PlanCache,
     request_queue::WorkQueue,
     tasks::Tasks,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use desk_core::{
-    AUDIO_BLOCK_MAX_PASSAGES, AudioBlock, AudioCache, AudioProfile, BillingUnit, Book,
-    GenerationJournal, GenerationPrepare, GenerationState, OfflineManifest, Store, plan_chapter,
+    AUDIO_BLOCK_MAX_PASSAGES, AudioBlock, AudioCache, AudioProfile, BillingUnit, Book, EditionPlan,
+    GenerationJournal, GenerationPrepare, GenerationState, OfflineManifest, Store,
 };
 use readio_speech::{SpeechAudio, SpeechService};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct Quote {
     manifest: OfflineManifest,
+    plan: Arc<desk_core::EditionPlan>,
     cached_blocks: usize,
     characters: usize,
     text_bytes: usize,
@@ -90,8 +92,31 @@ pub struct OfflineStatus {
 #[serde(rename_all = "camelCase")]
 pub struct AudioPlan {
     profile_id: String,
-    blocks: Vec<AudioBlock>,
+    blocks: Vec<AudioBlockInfo>,
     offline: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioBlockInfo {
+    id: String,
+    chapter: usize,
+    start: usize,
+    end: usize,
+    passages: Vec<desk_core::AudioPart>,
+    characters: usize,
+}
+impl From<&AudioBlock> for AudioBlockInfo {
+    fn from(block: &AudioBlock) -> Self {
+        Self {
+            id: block.id.clone(),
+            chapter: block.chapter,
+            start: block.start,
+            end: block.end,
+            passages: block.passages.clone(),
+            characters: block.characters,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -273,13 +298,15 @@ fn price_matches(quote: &Quote, price: Option<&Price>, free: bool) -> bool {
 
 struct OfflineWork {
     book_id: String,
-    book: Arc<Book>,
+    plan: Arc<desk_core::EditionPlan>,
     profile: AudioProfile,
     generation: u64,
     started_at: Instant,
     allowed: HashSet<String>,
     retry_attempts: HashMap<String, String>,
 }
+
+type SharedPlanner = Arc<std::sync::Mutex<Option<(String, Arc<desk_core::ChapterPlanner>)>>>;
 
 pub struct OfflineManager {
     store: Arc<std::sync::Mutex<Store>>,
@@ -296,6 +323,13 @@ pub struct OfflineManager {
     journal: Arc<std::sync::Mutex<GenerationJournal>>,
     queue: WorkQueue,
     tasks: Arc<Tasks>,
+    chapter_plans: Arc<PlanCache<plans::ChapterPlan>>,
+    edition_plans: Arc<PlanCache<EditionPlan>>,
+    manifest_plans: Arc<PlanCache<OfflineManifest>>,
+    planner: SharedPlanner,
+    plan_gate: Mutex<()>,
+    #[cfg(test)]
+    chapter_builds: Arc<AtomicUsize>,
     #[cfg(test)]
     test_provider: Option<Arc<crate::test_provider::MockSpeech>>,
 }
@@ -321,6 +355,13 @@ impl OfflineManager {
             journal: Arc::new(std::sync::Mutex::new(journal)),
             queue: WorkQueue::default(),
             tasks: Tasks::new(),
+            chapter_plans: Arc::new(PlanCache::new(256 * 1024 * 1024)),
+            edition_plans: Arc::new(PlanCache::new(256 * 1024 * 1024)),
+            manifest_plans: Arc::new(PlanCache::new(16 * 1024 * 1024)),
+            planner: Arc::new(std::sync::Mutex::new(None)),
+            plan_gate: Mutex::new(()),
+            #[cfg(test)]
+            chapter_builds: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             test_provider: None,
         }))
@@ -383,6 +424,17 @@ impl OfflineManager {
         .await
         .map_err(|e| e.to_string())?
     }
+    async fn diagnostics(&self) -> IpcResult<Vec<desk_core::ManifestIssue>> {
+        let cache = Arc::clone(&self.cache);
+        tauri::async_runtime::spawn_blocking(move || {
+            cache
+                .scan_manifests()
+                .map(|report| report.issues)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
     async fn status(&self, book_id: &str) -> IpcResult<OfflineStatus> {
         let manifest = self
             .manifests()
@@ -390,6 +442,18 @@ impl OfflineManager {
             .into_iter()
             .find(|m| m.book_id == book_id);
         let Some(manifest) = manifest else {
+            if let Some(issue) = self
+                .diagnostics()
+                .await?
+                .into_iter()
+                .find(|issue| issue.book_id.as_deref() == Some(book_id))
+            {
+                return Ok(broken_status(
+                    book_id.into(),
+                    issue.profile_id,
+                    issue.message,
+                ));
+            }
             return Ok(OfflineStatus {
                 book_id: book_id.into(),
                 profile_id: None,
@@ -489,12 +553,16 @@ impl OfflineManager {
             .await?
             .into_iter()
             .find(|m| m.book_id == book_id);
-        let (book, profile) = self
-            .book_and_profile(book_id.clone(), existing.is_some())
-            .await?;
+        let (manifest, plan) = if let Some(manifest) = existing {
+            self.edition(manifest).await?
+        } else {
+            let (book, profile) = self.book_and_profile(book_id.clone(), false).await?;
+            self.new_edition(book, profile).await?
+        };
+        let profile = manifest.profile.clone();
         let cache = Arc::clone(&self.cache);
         let profile_copy = profile.clone();
-        let book_copy = book;
+        let plan_copy = Arc::clone(&plan);
         let journal = Arc::clone(&self.journal);
         let (block_ids, cached_blocks, characters, text_bytes, retry_attempts) =
             tauri::async_runtime::spawn_blocking(move || -> IpcResult<_> {
@@ -505,8 +573,8 @@ impl OfflineManager {
                 let mut missing = HashSet::new();
                 let mut retry_attempts = HashMap::new();
                 let journal = journal.lock().map_err(|e| e.to_string())?;
-                for chapter in 0..book_copy.chapters.len() {
-                    for block in plan_chapter(&book_copy, chapter, &profile_copy) {
+                for chapter in &plan_copy.chapters {
+                    for block in &chapter.blocks {
                         if cache
                             .verify(&block.id)
                             .map_err(|e| e.to_string())?
@@ -518,7 +586,7 @@ impl OfflineManager {
                             bytes = bytes.saturating_add(block.text.len());
                             if profile_copy.engine == "openrouter"
                                 && let Some(attempt) = journal
-                                    .latest(&block, &profile_copy)
+                                    .latest(block, &profile_copy)
                                     .map_err(|e| e.to_string())?
                                 && matches!(
                                     attempt.state,
@@ -528,7 +596,7 @@ impl OfflineManager {
                                 retry_attempts.insert(block.id.clone(), attempt.id);
                             }
                         }
-                        ids.push(block.id);
+                        ids.push(block.id.clone());
                     }
                 }
                 Ok((ids, cached, chars, bytes, retry_attempts))
@@ -538,10 +606,8 @@ impl OfflineManager {
         if block_ids.is_empty() {
             return Err("В книге нет текста для озвучивания".into());
         }
-        if let Some(old) = existing
-            && old.block_ids != block_ids
-        {
-            return Err("Текст книги изменился; удалите прежнюю офлайн-версию".into());
+        if manifest.block_ids != block_ids {
+            return Err("План издания не совпадает с манифестом".into());
         }
         let (pricing, free) = if characters == 0 {
             (None, true)
@@ -563,15 +629,9 @@ impl OfflineManager {
             .map_err(|e| e.to_string())??
         };
         let id = Uuid::new_v4().to_string();
-        let manifest = OfflineManifest {
-            book_id,
-            profile_id: profile.id(),
-            profile,
-            block_ids,
-            updated_at: 0,
-        };
         let quote = Quote {
             manifest,
+            plan,
             cached_blocks,
             characters,
             text_bytes,
@@ -617,7 +677,18 @@ impl OfflineManager {
             return Err("Состояние загрузки изменилось; запросите оценку снова".into());
         }
         let mut quotes = self.quotes.lock().await;
-        quotes.retain(|_, q| q.expires > Instant::now());
+        quotes.retain(|_, q| {
+            q.expires > Instant::now() && q.manifest.book_id != quote.manifest.book_id
+        });
+        if quotes.len() >= 2 {
+            let oldest = quotes
+                .iter()
+                .min_by_key(|(_, q)| q.expires)
+                .map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                quotes.remove(&oldest);
+            }
+        }
         quotes.insert(id, quote);
         drop(quotes);
         drop(jobs);
@@ -650,16 +721,23 @@ impl OfflineManager {
                 return Err("Тариф изменился; запросите оценку снова".into());
             }
         }
+        let _plan_lifecycle = self.plan_gate.lock().await;
         let (book, profile) = self.book_and_profile(book_id.clone(), false).await?;
-        let existing = self
+        let existing_manifest = self
             .manifests()
             .await?
             .into_iter()
-            .any(|m| m.book_id == book_id && m.profile_id == quote.manifest.profile_id);
+            .find(|m| m.book_id == book_id && m.profile_id == quote.manifest.profile_id);
+        let existing = existing_manifest.is_some();
+        if existing_manifest.as_ref().is_some_and(|manifest| {
+            manifest.plan_digest != quote.manifest.plan_digest
+                || manifest.block_ids != quote.manifest.block_ids
+        }) {
+            return Err("Офлайн-издание изменилось; запросите оценку снова".into());
+        }
         if !existing && profile != quote.manifest.profile {
             return Err("Настройки озвучивания изменились; запросите оценку снова".into());
         }
-        let book = Arc::new(book);
         let mut jobs = self.jobs.lock().await;
         if jobs.get(&book_id).map_or(0, |job| job.generation) != quote.job_generation {
             return Err("Состояние загрузки изменилось; запросите оценку снова".into());
@@ -669,17 +747,26 @@ impl OfflineManager {
         }
         let cache = Arc::clone(&self.cache);
         let manifest = quote.manifest.clone();
-        let book_check = Arc::clone(&book);
+        let plan_check = Arc::clone(&quote.plan);
         let result = tauri::async_runtime::spawn_blocking(
             move || -> IpcResult<(Vec<String>, usize, usize, HashSet<String>)> {
+                plan_check
+                    .validate(&book, &manifest.profile)
+                    .map_err(|e| e.to_string())?;
+                let digest = cache
+                    .save_edition_plan(&plan_check)
+                    .map_err(|e| e.to_string())?;
+                if manifest.plan_digest.as_deref() != Some(&digest) {
+                    return Err("План издания не соответствует манифесту".into());
+                }
                 cache.save_manifest(&manifest).map_err(|e| e.to_string())?;
                 let outcome = (|| {
                     let mut ids = Vec::new();
                     let mut missing = HashSet::new();
                     let mut chars = 0_usize;
                     let mut bytes = 0_usize;
-                    for chapter in 0..book_check.chapters.len() {
-                        for block in plan_chapter(&book_check, chapter, &manifest.profile) {
+                    for chapter in &plan_check.chapters {
+                        for block in &chapter.blocks {
                             if cache
                                 .verify(&block.id)
                                 .map_err(|e| e.to_string())?
@@ -689,7 +776,7 @@ impl OfflineManager {
                                 chars = chars.saturating_add(block.characters);
                                 bytes = bytes.saturating_add(block.text.len());
                             }
-                            ids.push(block.id);
+                            ids.push(block.id.clone());
                         }
                     }
                     Ok((ids, chars, bytes, missing))
@@ -746,7 +833,7 @@ impl OfflineManager {
                 worker
                     .worker(OfflineWork {
                         book_id: worker_id,
-                        book,
+                        plan: quote.plan,
                         profile: quote.manifest.profile,
                         generation,
                         started_at,
@@ -774,7 +861,7 @@ impl OfflineManager {
     async fn worker(self: Arc<Self>, work: OfflineWork) {
         let OfflineWork {
             book_id,
-            book,
+            plan,
             profile,
             generation,
             started_at,
@@ -782,29 +869,8 @@ impl OfflineManager {
             retry_attempts,
         } = work;
         let mut sequence = 0_u64;
-        for chapter in 0..book.chapters.len() {
-            let book_copy = Arc::clone(&book);
-            let profile_copy = profile.clone();
-            let blocks = match tauri::async_runtime::spawn_blocking(move || {
-                plan_chapter(&book_copy, chapter, &profile_copy)
-            })
-            .await
-            {
-                Ok(blocks) => blocks,
-                Err(error) => {
-                    let mut jobs = self.jobs.lock().await;
-                    if let Some(job) = jobs.get_mut(&book_id)
-                        && job.generation == generation
-                    {
-                        job.state = "error";
-                        job.error = Some(error.to_string());
-                    }
-                    self.queue.stop_offline(&book_id, generation);
-                    drop(jobs);
-                    return;
-                }
-            };
-            for block in blocks {
+        for chapter in &plan.chapters {
+            for block in &chapter.blocks {
                 if !allowed.contains(&block.id) {
                     continue;
                 }
@@ -830,7 +896,7 @@ impl OfflineManager {
                 let consent = retry_attempts.get(&block.id).cloned();
                 let result = Arc::clone(&self)
                     .request_block(
-                        block,
+                        block.clone(),
                         profile.clone(),
                         Some((book_id.clone(), generation)),
                         Some(started_at),
@@ -1174,14 +1240,8 @@ impl OfflineManager {
         let profile = profile.clone();
         let prepared = self
             .journal(move |journal| {
-                let consent = match (
-                    confirmed_attempt.as_deref(),
-                    journal.latest(&block, &profile)?,
-                ) {
-                    (Some(confirmed), Some(latest)) => latest.id == confirmed,
-                    _ => false,
-                };
-                let prepared = journal.prepare(&block, &profile, consent)?;
+                let prepared =
+                    journal.prepare_with_consent(&block, &profile, confirmed_attempt.as_deref())?;
                 if let GenerationPrepare::Ready(attempt) = &prepared {
                     journal.mark_submitted(&attempt.id)?;
                 }
@@ -1298,15 +1358,20 @@ pub async fn audio_plan(
     offline: bool,
 ) -> IpcResult<AudioPlan> {
     let manager = Arc::clone(&state.offline);
-    let (book, profile) = manager.book_and_profile(book_id, offline).await?;
-    if chapter >= book.chapters.len() {
-        return Err("Глава не найдена".into());
-    }
-    let profile_id = profile.id();
-    let blocks =
-        tauri::async_runtime::spawn_blocking(move || plan_chapter(&book, chapter, &profile))
-            .await
-            .map_err(|e| e.to_string())?;
+    let (profile_id, blocks) = if offline {
+        let (manifest, plan) = manager.saved_edition(book_id).await?;
+        let chapter = plan.chapters.get(chapter).ok_or("Глава не найдена")?;
+        (
+            manifest.profile_id.clone(),
+            chapter.blocks.iter().map(AudioBlockInfo::from).collect(),
+        )
+    } else {
+        let (profile, plan) = manager.chapter_plan(book_id, chapter).await?;
+        (
+            profile.id(),
+            plan.blocks.iter().map(AudioBlockInfo::from).collect(),
+        )
+    };
     Ok(AudioPlan {
         profile_id,
         blocks,
@@ -1380,16 +1445,27 @@ pub async fn audio_block(
     {
         return Err(BlockError::cancelled());
     }
-    let (book, profile) = manager.book_and_profile(book_id, offline).await?;
-    let profile_copy = profile.clone();
-    let block = tauri::async_runtime::spawn_blocking(move || {
-        plan_chapter(&book, chapter, &profile_copy)
-            .into_iter()
-            .find(|b| b.id == block_id)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "Аудиоблок не найден".to_owned())?;
+    let (profile, block) = if offline {
+        let (manifest, plan) = manager.saved_edition(book_id).await?;
+        let block = plan
+            .block(chapter, &block_id)
+            .cloned()
+            .ok_or("Аудиоблок не найден в сохранённом плане")?;
+        (manifest.profile.clone(), block)
+    } else {
+        let (profile, plan) = manager.chapter_plan(book_id, chapter).await?;
+        let block = plan
+            .block(&block_id)
+            .cloned()
+            .ok_or("Аудиоблок не найден")?;
+        (profile, block)
+    };
+    if !manager
+        .queue
+        .is_current_playback(&session, revision, &block_id)
+    {
+        return Err(BlockError::cancelled());
+    }
     if offline {
         let cache = Arc::clone(&manager.cache);
         let id = block.id.clone();
@@ -1459,15 +1535,89 @@ pub async fn offline_status(
     state.offline.status(&book_id).await
 }
 #[tauri::command]
+pub async fn offline_diagnostics(
+    state: State<'_, AppState>,
+) -> IpcResult<Vec<desk_core::ManifestIssue>> {
+    state.offline.diagnostics().await
+}
+#[tauri::command]
+pub async fn offline_restore_manifest(
+    state: State<'_, AppState>,
+    file: String,
+    backup_path: String,
+) -> IpcResult<()> {
+    let _permit = state
+        .offline
+        .tasks
+        .enter()
+        .ok_or("Приложение закрывается")?;
+    let _plan_lifecycle = state.offline.plan_gate.lock().await;
+    {
+        let mut jobs = state.offline.jobs.lock().await;
+        for (book_id, job) in jobs.iter_mut() {
+            state.offline.queue.stop_offline(book_id, job.generation);
+            job.state = "paused";
+            job.generation = job.generation.wrapping_add(1);
+        }
+    }
+    state.offline.quotes.lock().await.clear();
+    let cache = Arc::clone(&state.offline.cache);
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        cache
+            .restore_manifest(&file, std::path::Path::new(&backup_path))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    {
+        let _store = state.store.lock().map_err(|e| e.to_string())?;
+        state.offline.invalidate_plans();
+    }
+    outcome
+}
+#[tauri::command]
 pub async fn offline_list(state: State<'_, AppState>) -> IpcResult<Vec<OfflineStatus>> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for manifest in state.offline.manifests().await? {
         if seen.insert(manifest.book_id.clone()) {
-            result.push(state.offline.status(&manifest.book_id).await?);
+            let status = state
+                .offline
+                .status(&manifest.book_id)
+                .await
+                .unwrap_or_else(|error| {
+                    broken_status(manifest.book_id, Some(manifest.profile_id), error)
+                });
+            result.push(status);
+        }
+    }
+    for issue in state.offline.diagnostics().await? {
+        if let Some(book_id) = issue.book_id
+            && seen.insert(book_id.clone())
+        {
+            result.push(broken_status(
+                book_id,
+                issue.profile_id,
+                format!("Манифест издания повреждён: {}", issue.message),
+            ));
         }
     }
     Ok(result)
+}
+const fn broken_status(
+    book_id: String,
+    profile_id: Option<String>,
+    error: String,
+) -> OfflineStatus {
+    OfflineStatus {
+        book_id,
+        profile_id,
+        state: "error",
+        total_blocks: 0,
+        cached_blocks: 0,
+        bytes: 0,
+        error: Some(error),
+    }
 }
 #[tauri::command]
 pub async fn offline_pause(
@@ -1558,6 +1708,11 @@ impl OfflineManager {
         .map_err(|e| e.to_string())?
     }
     pub(crate) async fn remove_all(&self, book_id: &str) -> IpcResult<()> {
+        let _plan_lifecycle = self.plan_gate.lock().await;
+        {
+            let _store = self.store.lock().map_err(|e| e.to_string())?;
+            self.invalidate_plans();
+        }
         let mut jobs = self.jobs.lock().await;
         let job = jobs.entry(book_id.to_owned()).or_insert_with(|| Job {
             state: "paused",
@@ -1589,6 +1744,10 @@ impl OfflineManager {
             .lock()
             .await
             .retain(|_, quote| quote.manifest.book_id != book_id);
+        {
+            let _store = self.store.lock().map_err(|e| e.to_string())?;
+            self.invalidate_plans();
+        }
         outcome
     }
 }
@@ -1720,11 +1879,22 @@ mod tests {
             other: BTreeMap::new(),
         };
         let mut quote = Quote {
+            plan: Arc::new(
+                desk_core::EditionPlan::build(
+                    &Book {
+                        id: "book".into(),
+                        ..Book::default()
+                    },
+                    &profile,
+                )
+                .unwrap(),
+            ),
             manifest: OfflineManifest {
                 book_id: "book".into(),
                 profile_id: profile.id(),
                 profile,
                 block_ids: Vec::new(),
+                plan_digest: None,
                 updated_at: 0,
             },
             cached_blocks: 0,
@@ -1778,11 +1948,22 @@ mod tests {
             max_escaped_bytes: None,
         };
         let mut quote = Quote {
+            plan: Arc::new(
+                desk_core::EditionPlan::build(
+                    &Book {
+                        id: "book".into(),
+                        ..Book::default()
+                    },
+                    &profile,
+                )
+                .unwrap(),
+            ),
             manifest: OfflineManifest {
                 book_id: "book".into(),
                 profile_id: profile.id(),
                 profile,
                 block_ids: Vec::new(),
+                plan_digest: None,
                 updated_at: 0,
             },
             cached_blocks: 0,
@@ -1939,3 +2120,10 @@ mod tests {
 #[cfg(test)]
 #[path = "offline_pipeline_tests.rs"]
 mod pipeline_tests;
+
+#[cfg(test)]
+#[path = "offline_edition_tests.rs"]
+mod edition_tests;
+
+#[path = "offline_plans.rs"]
+mod plans;

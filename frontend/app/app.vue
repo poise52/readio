@@ -72,6 +72,7 @@ import type {
   AudioPlan,
   OfflineStatus,
   OfflineQuote,
+  OfflineDiagnostic,
 } from "./types/models";
 
 type Page = "library" | "reader" | "marks" | "settings";
@@ -105,6 +106,7 @@ const active = ref(0);
 const playing = ref(false);
 const paused = ref(false);
 const offlineStatuses = ref<Record<string, OfflineStatus>>({});
+const offlineDiagnostics = ref<OfflineDiagnostic[]>([]);
 const offlineSource = ref<Record<string, boolean>>({});
 const offlineDialog = ref(false);
 const offlineDialogElement = ref<HTMLElement | null>(null);
@@ -775,8 +777,9 @@ async function play() {
               player.currentTime / player.duration,
             );
             if (!position) return;
-            const changed = position.index !== active.value;
-            active.value = position.index;
+            const index = indexAt(position.offset);
+            const changed = index !== active.value;
+            active.value = index;
             current.offset = position.offset;
             if (changed || Date.now() - lastSaved >= 5000) {
               lastSaved = Date.now();
@@ -841,7 +844,7 @@ async function play() {
       }
       if (current.chapter + 1 >= current.chapters.length) {
         current.offset =
-          current.chapters[current.chapter]?.text.length ?? current.offset;
+          current.chapters[current.chapter]?.length ?? current.offset;
         completed.value = true;
         playing.value = false;
         await savePositionNow();
@@ -1015,10 +1018,100 @@ async function setBackground(clear = false) {
     report(e);
   }
 }
+let diagnosticsRequest = 0;
+let diagnosticsAfterPollFailure = false;
+async function refreshOfflineDiagnostics(dialogToken?: number) {
+  const request = ++diagnosticsRequest;
+  try {
+    const issues = await invoke<OfflineDiagnostic[]>("offline_diagnostics");
+    if (
+      request !== diagnosticsRequest ||
+      closing.value ||
+      !mounted ||
+      (dialogToken !== undefined &&
+        (dialogToken !== offlineDialogGeneration || !offlineDialog.value))
+    )
+      return;
+    offlineDiagnostics.value = issues;
+  } catch (error) {
+    if (
+      request === diagnosticsRequest &&
+      mounted &&
+      !closing.value &&
+      (dialogToken === undefined ||
+        (dialogToken === offlineDialogGeneration && offlineDialog.value))
+    )
+      report(error);
+  }
+}
+function diagnosticTitle(issue: OfflineDiagnostic) {
+  return (
+    books.value.find((item) => item.id === issue.bookId)?.title ??
+    "Неизвестное издание"
+  );
+}
+function diagnosticFilename(file: string) {
+  return file.split(/[\\/]/).pop() || file;
+}
+async function restoreOfflineManifest(issue: OfflineDiagnostic) {
+  if (closing.value || offlineBusy.value || !offlineDialog.value) return;
+  const token = offlineDialogGeneration;
+  offlineBusy.value = true;
+  offlineError.value = "";
+  try {
+    const backupPath = await open({
+      multiple: false,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (
+      token !== offlineDialogGeneration ||
+      !offlineDialog.value ||
+      closing.value ||
+      !backupPath
+    )
+      return;
+    await invoke("offline_restore_manifest", { file: issue.file, backupPath });
+    if (
+      token !== offlineDialogGeneration ||
+      !offlineDialog.value ||
+      closing.value
+    )
+      return;
+    await refreshOfflineDiagnostics(token);
+    if (
+      token !== offlineDialogGeneration ||
+      !offlineDialog.value ||
+      closing.value
+    )
+      return;
+    await refreshOfflineStatuses(
+      () =>
+        token === offlineDialogGeneration &&
+        offlineDialog.value &&
+        !closing.value,
+    );
+    if (
+      token === offlineDialogGeneration &&
+      offlineDialog.value &&
+      !closing.value
+    )
+      offlineInfo.value = "Резервная копия восстановлена.";
+  } catch (error) {
+    if (
+      token === offlineDialogGeneration &&
+      offlineDialog.value &&
+      !closing.value
+    )
+      offlineError.value = audioErrorMessage(error);
+  } finally {
+    if (token === offlineDialogGeneration && offlineDialog.value)
+      offlineBusy.value = false;
+  }
+}
 let offlinePolling = false;
 let offlinePollPending = false;
 const pausedPollDeadlines = new Map<string, number>();
-async function refreshOfflineStatuses() {
+async function refreshOfflineStatuses(isCurrent: () => boolean = () => true) {
   if (!native.value) return;
   if (offlinePolling) {
     offlinePollPending = true;
@@ -1028,6 +1121,8 @@ async function refreshOfflineStatuses() {
   clearTimeout(statusTimer);
   try {
     const statuses = await invoke<OfflineStatus[]>("offline_list");
+    if (!isCurrent() || closing.value || !mounted) return;
+    diagnosticsAfterPollFailure = false;
     offlineStatuses.value = Object.fromEntries(
       statuses.map((status) => [status.bookId, status]),
     );
@@ -1055,7 +1150,12 @@ async function refreshOfflineStatuses() {
       });
     }
   } catch (e) {
+    if (!isCurrent() || closing.value || !mounted) return;
     report(e);
+    if (!diagnosticsAfterPollFailure) {
+      diagnosticsAfterPollFailure = true;
+      void refreshOfflineDiagnostics();
+    }
   } finally {
     offlinePolling = false;
     const now = Date.now();
@@ -1107,6 +1207,7 @@ function closeOffline() {
   offlineDialogGeneration++;
   offlineDialog.value = false;
   offlineBusy.value = false;
+  if (native.value && !closing.value) void refreshOfflineDiagnostics();
   offlinePreviousFocus?.focus();
 }
 function trapDialogFocus(event: KeyboardEvent) {
@@ -1155,24 +1256,38 @@ async function quoteOffline() {
     if (token === offlineDialogGeneration) offlineBusy.value = false;
   }
 }
-async function showOffline() {
-  if (!book.value) return;
+async function showOfflineDialog(bookId: string) {
+  if (closing.value) return;
   offlinePreviousFocus =
     document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
-  offlineDialogGeneration++;
+  const openToken = ++offlineDialogGeneration;
   offlineRetryConfirmed.value = false;
-  offlineBookId.value = book.value.id;
+  offlineBookId.value = bookId;
   offlineDialog.value = true;
   await nextTick();
+  if (
+    openToken !== offlineDialogGeneration ||
+    !offlineDialog.value ||
+    closing.value
+  )
+    return;
   offlineCloseButton.value?.focus();
   offlineBusy.value = false;
   offlineError.value = "";
   offlineInfo.value = "";
   offlineQuote.value = null;
-  const state = offlineStatuses.value[offlineBookId.value]?.state;
-  if (state !== "complete" && state !== "running") await quoteOffline();
+  const state = offlineStatuses.value[bookId]?.state;
+  const quote =
+    bookId && state !== "complete" && state !== "running"
+      ? quoteOffline()
+      : Promise.resolve();
+  void refreshOfflineDiagnostics(offlineDialogGeneration);
+  await quote;
+}
+async function showOffline() {
+  if (book.value) await showOfflineDialog(book.value.id);
 }
 async function saveBillingUnit() {
   const model = offlineQuote.value?.model;
@@ -1550,6 +1665,7 @@ onMounted(async () => {
         offlineSource.value = {};
       }
       void refreshOfflineStatuses();
+      void refreshOfflineDiagnostics();
     } catch (e) {
       report(e);
     }
@@ -1623,6 +1739,15 @@ onBeforeUnmount(() => {
           @click="notice = ''"
         >
           <X />
+        </button>
+      </div>
+      <div v-if="offlineDiagnostics.length" class="notice" role="status">
+        <span
+          >Обнаружены повреждённые офлайн-издания. Аудиофайлы защищены от
+          очистки.</span
+        >
+        <button class="tonal" @click="showOfflineDialog('')">
+          Восстановить
         </button>
       </div>
       <section v-if="page === 'library'" class="view">
@@ -2285,7 +2410,11 @@ onBeforeUnmount(() => {
           aria-labelledby="offline-heading"
         >
           <header class="dialog-heading">
-            <h2 id="offline-heading">Сохранить озвучку офлайн</h2>
+            <h2 id="offline-heading">
+              {{
+                offlineBookId ? "Сохранить озвучку офлайн" : "Офлайн-издания"
+              }}
+            </h2>
             <button
               ref="offlineCloseButton"
               class="icon"
@@ -2295,10 +2424,37 @@ onBeforeUnmount(() => {
               <X />
             </button>
           </header>
-          <p>
+          <p v-if="offlineBookId">
             Книга отправляется на озвучку частями. Для облачного голоса текст
             передаётся выбранному сервису.
           </p>
+          <section
+            v-if="offlineDiagnostics.length"
+            aria-labelledby="offline-diagnostics-heading"
+          >
+            <h3 id="offline-diagnostics-heading">
+              Повреждённые офлайн-издания
+            </h3>
+            <p class="warning">
+              Аудиофайлы защищены от очистки. Выберите резервную копию описания
+              издания для восстановления.
+            </p>
+            <div v-for="issue in offlineDiagnostics" :key="issue.file">
+              <p>
+                <strong>{{ diagnosticTitle(issue) }}</strong> ·
+                {{ diagnosticFilename(issue.file) }}<br /><small>{{
+                  issue.message
+                }}</small>
+              </p>
+              <button
+                class="tonal"
+                :disabled="offlineBusy"
+                @click="restoreOfflineManifest(issue)"
+              >
+                Восстановить из резервной копии
+              </button>
+            </div>
+          </section>
           <template
             v-if="
               offlineStatuses[offlineBookId] &&

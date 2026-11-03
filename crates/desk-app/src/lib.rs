@@ -3,12 +3,13 @@ mod credentials;
 mod instance;
 mod lifecycle;
 mod offline;
+mod plan_cache;
 mod request_queue;
 mod tasks;
 #[cfg(test)]
 mod test_provider;
 
-use desk_core::{Book, BookSummary, BookmarkEntry, Mark, Preferences, Store};
+use desk_core::{BookSummary, BookmarkEntry, Mark, Preferences, ReaderBook, Store};
 use readio_speech::{OpenRouterModel, SpeechAudio, SpeechService, Voice};
 use serde::Serialize;
 use std::{
@@ -138,29 +139,30 @@ async fn import_books(
     paths: Vec<String>,
 ) -> IpcResult<Vec<BookSummary>> {
     let store = Arc::clone(&state.store);
+    let offline = Arc::clone(&state.offline);
     tauri::async_runtime::spawn_blocking(move || {
         let books = paths
             .iter()
             .map(|p| desk_core::import_book(Path::new(p)))
             .collect::<desk_core::Result<Vec<_>>>()
             .map_err(|e| e.to_string())?;
-        store
-            .lock()
-            .map_err(|e| e.to_string())?
-            .import_parsed(&books)
-            .map_err(|e| e.to_string())
+        let store = store.lock().map_err(|e| e.to_string())?;
+        let result = store.import_parsed(&books).map_err(|e| e.to_string());
+        offline.invalidate_plans();
+        drop(store);
+        result
     })
     .await
     .map_err(|e| e.to_string())?
 }
 #[tauri::command]
-async fn open_book(state: State<'_, AppState>, id: String) -> IpcResult<Book> {
+async fn open_book(state: State<'_, AppState>, id: String) -> IpcResult<ReaderBook> {
     let store = Arc::clone(&state.store);
     tauri::async_runtime::spawn_blocking(move || {
         store
             .lock()
             .map_err(|e| e.to_string())?
-            .book(&id)
+            .reader_book(&id)
             .map_err(|e| e.to_string())
     })
     .await
@@ -170,7 +172,11 @@ async fn open_book(state: State<'_, AppState>, id: String) -> IpcResult<Book> {
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned command arguments.
 async fn delete_book(state: State<'_, AppState>, id: String) -> IpcResult<()> {
     state.offline.remove_all(&id).await?;
-    with_store(&state, |s| s.delete(&id))
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let result = store.delete(&id).map_err(|e| e.to_string());
+    state.offline.invalidate_plans();
+    drop(store);
+    result
 }
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned command arguments.
@@ -223,12 +229,15 @@ fn save_preferences(
 #[tauri::command]
 async fn import_legacy(state: State<'_, AppState>, path: String) -> IpcResult<usize> {
     let store = Arc::clone(&state.store);
+    let offline = Arc::clone(&state.offline);
     tauri::async_runtime::spawn_blocking(move || {
-        store
-            .lock()
-            .map_err(|e| e.to_string())?
+        let store = store.lock().map_err(|e| e.to_string())?;
+        let result = store
             .import_legacy(Path::new(&path))
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        offline.invalidate_plans();
+        drop(store);
+        result
     })
     .await
     .map_err(|e| e.to_string())?
@@ -419,6 +428,8 @@ pub fn run() -> tauri::Result<()> {
             offline::offline_start,
             offline::offline_status,
             offline::offline_list,
+            offline::offline_diagnostics,
+            offline::offline_restore_manifest,
             offline::offline_pause,
             offline::offline_remove
         ])
