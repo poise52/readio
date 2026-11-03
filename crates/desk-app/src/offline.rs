@@ -1754,6 +1754,8 @@ impl OfflineManager {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
     use std::{
         collections::BTreeMap,
@@ -1766,6 +1768,18 @@ mod tests {
             Store::open(&root).map_err(|e| e.to_string())?,
         ));
         Ok((OfflineManager::new(store, root.clone())?, root))
+    }
+    async fn cleanup(manager: Arc<OfflineManager>, root: std::path::PathBuf) -> IpcResult<()> {
+        manager.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(&manager) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "Не завершились задачи тестового менеджера".to_owned())?;
+        drop(manager);
+        std::fs::remove_dir_all(root).map_err(|e| e.to_string())
     }
     #[tokio::test]
     async fn concurrent_failed_requests_share_error_and_require_explicit_retry() -> IpcResult<()> {
@@ -1816,8 +1830,7 @@ mod tests {
             .await?;
         assert!(retry.is_some());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        drop(manager);
-        std::fs::remove_dir_all(root).map_err(|e| e.to_string())?;
+        cleanup(manager, root).await?;
         Ok(())
     }
     #[tokio::test]
@@ -1859,8 +1872,7 @@ mod tests {
         .ok_or_else(|| "Отменено".to_owned())?;
         drop(gate);
         assert_eq!(audio.data, STANDARD.encode(b"cached"));
-        drop(manager);
-        std::fs::remove_dir_all(root).map_err(|e| e.to_string())?;
+        cleanup(manager, root).await?;
         Ok(())
     }
     #[test]
@@ -2036,8 +2048,7 @@ mod tests {
                 .is_err()
         );
         assert!(manager.manifests().await?.is_empty());
-        drop(manager);
-        std::fs::remove_dir_all(root).map_err(|e| e.to_string())?;
+        cleanup(manager, root).await?;
         Ok(())
     }
     #[tokio::test]
@@ -2069,8 +2080,7 @@ mod tests {
                 .get("any/model"),
             Some(&BillingUnit::Utf8Byte)
         );
-        drop(manager);
-        std::fs::remove_dir_all(root).map_err(|e| e.to_string())?;
+        cleanup(manager, root).await?;
         Ok(())
     }
     #[tokio::test]
@@ -2111,8 +2121,7 @@ mod tests {
             foreground?.ok_or_else(|| "Нет аудио".to_owned())?.data,
             STANDARD.encode(b"cached")
         );
-        drop(manager);
-        std::fs::remove_dir_all(root).map_err(|e| e.to_string())?;
+        cleanup(manager, root).await?;
         Ok(())
     }
 }

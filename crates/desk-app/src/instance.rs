@@ -31,9 +31,12 @@ impl InstanceGuard {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
     use std::{
         io::Read,
+        ops::{Deref, DerefMut},
         path::PathBuf,
         process::{Child, Command, Stdio},
         thread,
@@ -86,7 +89,32 @@ mod tests {
         }
     }
 
-    fn spawn(root: &Path, result: &Path, hold: bool) -> Child {
+    struct TestChild(Child);
+
+    impl Deref for TestChild {
+        type Target = Child;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl DerefMut for TestChild {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    fn spawn(root: &Path, result: &Path, hold: bool) -> TestChild {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "instance::tests::child", "--nocapture"])
@@ -97,8 +125,10 @@ mod tests {
             .stderr(Stdio::null());
         if hold {
             command.env(HOLD_ENV, "1");
+        } else {
+            command.env_remove(HOLD_ENV);
         }
-        command.spawn().unwrap()
+        TestChild(command.spawn().unwrap())
     }
 
     fn status(child: &mut Child, path: &Path) -> String {

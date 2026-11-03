@@ -395,7 +395,10 @@ mod tests {
         plan.chapters[0].blocks.push(first.clone());
         let estimate = plan.estimated_bytes();
         let selected = plan.block(0, &first.id).unwrap();
-        assert!(std::ptr::eq(selected, &plan.chapters[0].blocks[0]));
+        assert!(std::ptr::eq(
+            std::ptr::from_ref(selected),
+            std::ptr::from_ref(&plan.chapters[0].blocks[0])
+        ));
         assert_eq!(plan.estimated_bytes(), estimate);
     }
 
