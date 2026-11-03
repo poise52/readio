@@ -382,6 +382,7 @@ impl GenerationJournal {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::{
@@ -541,7 +542,7 @@ mod tests {
         let second = GenerationJournal::open(&dir)?;
         let barrier = Arc::new(Barrier::new(2));
         let left_barrier = Arc::clone(&barrier);
-        let stale_id = stale.id.clone();
+        let stale_id = stale.id;
         let left = thread::spawn(move || {
             left_barrier.wait();
             first.mark_submitted(&stale_id).is_ok()
@@ -719,18 +720,16 @@ mod tests {
         let journal = GenerationJournal::open(&dir)?;
         let attempt = ready(journal.prepare(&block, &profile, false)?);
         let barrier = Arc::new(Barrier::new(2));
-        let threads: Vec<_> = (0..2)
-            .map(|_| {
-                let dir = dir.clone();
-                let barrier = Arc::clone(&barrier);
-                let id = attempt.id.clone();
-                thread::spawn(move || {
-                    let journal = GenerationJournal::open(&dir).unwrap();
-                    barrier.wait();
-                    journal.mark_submitted(&id).is_ok()
-                })
+        let threads: [thread::JoinHandle<bool>; 2] = std::array::from_fn(|_| {
+            let dir = dir.clone();
+            let barrier = Arc::clone(&barrier);
+            let id = attempt.id.clone();
+            thread::spawn(move || {
+                let journal = GenerationJournal::open(&dir).unwrap();
+                barrier.wait();
+                journal.mark_submitted(&id).is_ok()
             })
-            .collect();
+        });
         assert_eq!(
             threads
                 .into_iter()

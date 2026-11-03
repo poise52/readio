@@ -451,6 +451,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         file.write_all(data)?;
         file.sync_all()?;
         fs::rename(&tmp, path)?;
+        #[cfg(unix)]
         sync_parent_directory(path)?;
         Ok(())
     })();
@@ -465,12 +466,6 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
         .parent()
         .ok_or_else(|| Error::Format("Некорректный путь кеша".into()))?;
     fs::File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> Result<()> {
-    // Windows does not expose a documented directory flush through std::fs.
     Ok(())
 }
 
@@ -1008,7 +1003,10 @@ impl AudioCache {
             }
             let path = self.root.join("editions").join(format!("{digest}.json"));
             match fs::remove_file(&path) {
-                Ok(()) => sync_parent_directory(&path)?,
+                Ok(()) => {
+                    #[cfg(unix)]
+                    sync_parent_directory(&path)?;
+                }
                 Err(error) if error.kind() == ErrorKind::NotFound => (),
                 Err(error) => return Err(error.into()),
             }
@@ -1535,9 +1533,9 @@ mod tests {
         let first = OfflineManifest {
             book_id: "first".into(),
             profile_id: profile.id(),
-            profile: profile.clone(),
+            profile,
             block_ids: plan.block_ids(),
-            plan_digest: Some(digest.clone()),
+            plan_digest: Some(digest),
             updated_at: 0,
         };
         let second = OfflineManifest {
@@ -1576,6 +1574,7 @@ mod tests {
         let modified = SystemTime::now() - std::time::Duration::from_hours(25);
         file.set_times(fs::FileTimes::new().set_modified(modified))
             .unwrap();
+        drop(file);
         cache.evict().unwrap();
         assert!(fresh.exists());
         assert!(!old.exists());

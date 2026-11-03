@@ -2,7 +2,7 @@
 
 use super::*;
 use desk_core::{Chapter, plan_chapter_v1};
-use std::{path::PathBuf, time::Instant};
+use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf, time::Instant};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -73,7 +73,7 @@ fn openrouter_profile() -> AudioProfile {
         voice: "openrouter".into(),
         model: Some("test-model".into()),
         model_voice: None,
-        dictionary: Default::default(),
+        dictionary: BTreeMap::new(),
         max_escaped_bytes: Some(100),
     }
 }
@@ -240,9 +240,10 @@ async fn saved_edition_and_worker_keep_snapshot_boundaries_and_remove_does_not_r
 -> TestResult {
     let mock = crate::test_provider::MockSpeech::new();
     let fixture = Fixture::new(Some(Arc::clone(&mock)));
-    let content: String = (0..25)
-        .map(|index| format!("Фраза {index} с уникальным содержимым. "))
-        .collect();
+    let mut content = String::new();
+    for index in 0..25 {
+        write!(content, "Фраза {index} с уникальным содержимым. ").unwrap();
+    }
     let source = book("snapshot-id", &[&content]);
     fixture.insert(&source);
     let manager = fixture.manager();

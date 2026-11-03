@@ -4,7 +4,7 @@ use desk_core::{
 use serde_json::json;
 
 #[test]
-fn v1_preserves_canonical_ids_text_and_utf16_offsets() {
+fn v1_preserves_canonical_ids_text_and_utf16_offsets() -> Result<(), serde_json::Error> {
     let mut profile = AudioProfile::from_preferences(&Preferences::default());
     profile.dictionary.insert("мир".into(), "МИИР".into());
     profile.dictionary.insert("hello".into(), "привет".into());
@@ -29,7 +29,8 @@ fn v1_preserves_canonical_ids_text_and_utf16_offsets() {
         plan_chapter(&book, 0, &profile),
         plan_chapter_v1(&book, 0, &profile),
     ] {
-        assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+        assert_eq!(serde_json::to_value(actual)?, expected);
     }
     assert!(plan_chapter_v1(&book, 1, &profile).is_empty());
+    Ok(())
 }
