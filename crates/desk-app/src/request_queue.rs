@@ -14,6 +14,7 @@ struct QueueState {
     playback: Option<Playback>,
     offline: HashMap<String, Offline>,
     submitted: HashSet<String>,
+    submitted_books: HashMap<String, HashSet<String>>,
 }
 
 #[derive(Debug)]
@@ -142,7 +143,12 @@ impl WorkQueue {
             return false;
         }
         offline.sequence = Some(sequence);
-        offline.wanted = wanted;
+        offline.wanted.clone_from(&wanted);
+        for block in wanted {
+            if let Some(books) = state.submitted_books.get_mut(&block) {
+                books.insert(book.to_owned());
+            }
+        }
         true
     }
 
@@ -172,6 +178,13 @@ impl WorkQueue {
         if state.submitted.contains(block) || !state.needs(block) {
             return false;
         }
+        let books = state
+            .offline
+            .iter()
+            .filter(|(_, job)| job.active && job.wanted.contains(block))
+            .map(|(book, _)| book.clone())
+            .collect();
+        state.submitted_books.insert(block.to_owned(), books);
         state.submitted.insert(block.to_owned());
         true
     }
@@ -179,7 +192,28 @@ impl WorkQueue {
     pub(crate) fn complete(&self, block: &str) {
         if let Ok(mut state) = self.state.lock() {
             state.submitted.remove(block);
+            state.submitted_books.remove(block);
         }
+    }
+    pub(crate) fn pending_for_book(&self, book: &str) -> usize {
+        self.state.lock().map_or(0, |state| {
+            state
+                .submitted_books
+                .values()
+                .filter(|books| books.contains(book))
+                .count()
+        })
+    }
+    pub(crate) fn submitted_books(&self, block: &str) -> Vec<String> {
+        self.state.lock().map_or_else(
+            |_| Vec::new(),
+            |state| {
+                state
+                    .submitted_books
+                    .get(block)
+                    .map_or_else(Vec::new, |books| books.iter().cloned().collect())
+            },
+        )
     }
 
     pub(crate) fn close(&self) {

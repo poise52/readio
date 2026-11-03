@@ -29,6 +29,7 @@ fn profile() -> AudioProfile {
         model_voice: None,
         dictionary: BTreeMap::new(),
         max_escaped_bytes: None,
+        synthesis: None,
     }
 }
 

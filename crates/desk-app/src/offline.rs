@@ -1,3 +1,8 @@
+use crate::ipc::OfflineJobState;
+use crate::pricing::{
+    CostEstimate, EstimateSource, PricingUnit, UnknownCostReason, decimal_add, decimal_add_compare,
+    multiply_decimal, parse_decimal, unknown,
+};
 use crate::{AppState, IpcResult, credentials};
 use crate::{
     block_error::{BlockError, BlockErrorCode, BlockResult},
@@ -20,8 +25,10 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::State;
-use tokio::sync::{Mutex, Notify};
+use tauri::{Emitter, State};
+use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -60,6 +67,8 @@ pub struct QuoteResult {
     retry_required_blocks: usize,
     characters: usize,
     pricing: Option<Price>,
+    pricing_source: Option<&'static str>,
+    pricing_verified_at: Option<u64>,
     estimated_cost: Option<String>,
     billable_units: Option<usize>,
     cost_unit: PricingUnit,
@@ -72,21 +81,38 @@ pub struct QuoteResult {
 }
 #[derive(Clone)]
 struct Job {
-    state: &'static str,
+    state: OfflineJobState,
     error: Option<String>,
     generation: u64,
     engine: String,
+    budget: Option<BudgetState>,
+}
+#[derive(Clone)]
+struct BudgetState {
+    limits: OfflineBudget,
+    pricing: Option<Price>,
+    free: bool,
+    billing_unit: Option<BillingUnit>,
+    submitted: usize,
+    actual: String,
+    reserved: Option<(String, String)>,
+    unknown: usize,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfflineStatus {
     book_id: String,
     profile_id: Option<String>,
-    state: &'static str,
+    state: OfflineJobState,
     total_blocks: usize,
     cached_blocks: usize,
     bytes: u64,
     error: Option<String>,
+    pending_requests: usize,
+    actual_cost_usd: Option<String>,
+    estimated_reserved_usd: Option<String>,
+    unknown_cost_requests: usize,
+    submitted_requests: usize,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -150,112 +176,23 @@ impl Drop for ActivePin {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum PricingUnit {
-    Free,
-    Unknown,
-    Character,
-    Utf8Byte,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum UnknownCostReason {
-    ProviderUnitUnavailable,
-    AdditionalRateUnitUnavailable,
-    InvalidRate,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum EstimateSource {
-    Free,
-    User,
-}
-struct CostEstimate {
-    unit: PricingUnit,
-    units: Option<usize>,
-    amount: Option<String>,
-    reason: Option<UnknownCostReason>,
-    source: Option<EstimateSource>,
-}
-const fn unknown(reason: UnknownCostReason) -> CostEstimate {
-    CostEstimate {
-        unit: PricingUnit::Unknown,
-        units: None,
-        amount: None,
-        reason: Some(reason),
-        source: None,
-    }
-}
-fn parse_decimal(value: &str) -> Option<(u128, i32)> {
-    let value = value.trim();
-    let (mantissa, exponent) = value
-        .split_once(['e', 'E'])
-        .map_or((value, "0"), |(a, b)| (a, b));
-    let exponent: i32 = exponent.parse().ok()?;
-    if !(-128..=128).contains(&exponent) {
-        return None;
-    }
-    let (whole, fraction) = mantissa
-        .split_once('.')
-        .map_or((mantissa, ""), |(a, b)| (a, b));
-    if whole.is_empty()
-        || !whole.bytes().all(|c| c.is_ascii_digit())
-        || !fraction.bytes().all(|c| c.is_ascii_digit())
-    {
-        return None;
-    }
-    let digits = format!("{whole}{fraction}");
-    let coefficient: u128 = digits
-        .trim_start_matches('0')
-        .parse()
-        .or_else(|_| {
-            if digits.bytes().all(|c| c == b'0') {
-                Ok(0_u128)
-            } else {
-                Err(())
-            }
-        })
-        .ok()?;
-    Some((
-        coefficient,
-        exponent.checked_sub(i32::try_from(fraction.len()).ok()?)?,
-    ))
-}
-fn multiply_decimal(rate: &str, units: usize) -> Option<String> {
-    let (coefficient, exponent) = parse_decimal(rate)?;
-    let product = coefficient.checked_mul(u128::try_from(units).ok()?)?;
-    if product == 0 {
-        return Some("0".into());
-    }
-    let mut digits = product.to_string();
-    if exponent >= 0 {
-        let count = usize::try_from(exponent).ok()?;
-        if digits.len().checked_add(count)? > 128 {
-            return None;
-        }
-        digits.push_str(&"0".repeat(count));
-        return Some(digits);
-    }
-    let places = usize::try_from(exponent.checked_neg()?).ok()?;
-    if places > 128 {
-        return None;
-    }
-    if places >= digits.len() {
-        digits = format!("0.{}{}", "0".repeat(places - digits.len()), digits);
-    } else {
-        digits.insert(digits.len() - places, '.');
-    }
-    while digits.ends_with('0') {
-        digits.pop();
-    }
-    if digits.ends_with('.') {
-        digits.pop();
-    }
-    Some(digits)
-}
 fn cost(quote: &Quote) -> CostEstimate {
-    if quote.free {
+    estimate_cost(
+        quote.pricing.as_ref(),
+        quote.free,
+        quote.billing_unit,
+        quote.characters,
+        quote.text_bytes,
+    )
+}
+fn estimate_cost(
+    pricing: Option<&Price>,
+    free: bool,
+    billing_unit: Option<BillingUnit>,
+    characters: usize,
+    text_bytes: usize,
+) -> CostEstimate {
+    if free {
         return CostEstimate {
             unit: PricingUnit::Free,
             units: None,
@@ -264,10 +201,10 @@ fn cost(quote: &Quote) -> CostEstimate {
             source: Some(EstimateSource::Free),
         };
     }
-    let Some(unit) = quote.billing_unit else {
+    let Some(unit) = billing_unit else {
         return unknown(UnknownCostReason::ProviderUnitUnavailable);
     };
-    let Some(price) = quote.pricing.as_ref() else {
+    let Some(price) = pricing else {
         return unknown(UnknownCostReason::InvalidRate);
     };
     for value in std::iter::once(&price.completion).chain(price.other.values()) {
@@ -278,8 +215,8 @@ fn cost(quote: &Quote) -> CostEstimate {
         }
     }
     let (unit, units) = match unit {
-        BillingUnit::Character => (PricingUnit::Character, quote.characters),
-        BillingUnit::Utf8Byte => (PricingUnit::Utf8Byte, quote.text_bytes),
+        BillingUnit::Character => (PricingUnit::Character, characters),
+        BillingUnit::Utf8Byte => (PricingUnit::Utf8Byte, text_bytes),
     };
     let Some(amount) = multiply_decimal(&price.prompt, units) else {
         return unknown(UnknownCostReason::InvalidRate);
@@ -291,6 +228,45 @@ fn cost(quote: &Quote) -> CostEstimate {
         reason: None,
         source: Some(EstimateSource::User),
     }
+}
+type QuoteScan = (Vec<String>, usize, usize, usize, HashMap<String, String>);
+fn scan_quote(
+    plan: &EditionPlan,
+    profile: &AudioProfile,
+    journal: &std::sync::Mutex<GenerationJournal>,
+    mut verify: impl FnMut(&str) -> IpcResult<bool>,
+) -> IpcResult<QuoteScan> {
+    let mut ids = Vec::new();
+    let mut cached = 0;
+    let mut chars = 0_usize;
+    let mut bytes = 0_usize;
+    let mut missing = HashSet::new();
+    let mut retry_attempts = HashMap::new();
+    for chapter in &plan.chapters {
+        for block in &chapter.blocks {
+            if verify(&block.id)? {
+                cached += 1;
+            } else if missing.insert(block.id.clone()) {
+                chars = chars.saturating_add(block.characters);
+                bytes = bytes.saturating_add(block.text.len());
+                if profile.engine == "openrouter"
+                    && let Some(attempt) = journal
+                        .lock()
+                        .map_err(|e| e.to_string())?
+                        .latest(block, profile)
+                        .map_err(|e| e.to_string())?
+                    && matches!(
+                        attempt.state,
+                        GenerationState::Uncertain | GenerationState::Completed
+                    )
+                {
+                    retry_attempts.insert(block.id.clone(), attempt.id);
+                }
+            }
+            ids.push(block.id.clone());
+        }
+    }
+    Ok((ids, cached, chars, bytes, retry_attempts))
 }
 fn price_matches(quote: &Quote, price: Option<&Price>, free: bool) -> bool {
     quote.pricing.as_ref() == price && quote.free == free
@@ -306,16 +282,24 @@ struct OfflineWork {
     retry_attempts: HashMap<String, String>,
 }
 
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfflineBudget {
+    max_cost_usd: Option<String>,
+    max_new_blocks: Option<usize>,
+    allow_unknown_cost: bool,
+}
+
 type SharedPlanner = Arc<std::sync::Mutex<Option<(String, Arc<desk_core::ChapterPlanner>)>>>;
 
 pub struct OfflineManager {
     store: Arc<std::sync::Mutex<Store>>,
     cache: Arc<AudioCache>,
-    speech: SpeechService,
+    speech: Arc<SpeechService>,
     gate: Mutex<()>,
     interactive: AtomicUsize,
     credential_generation: AtomicU64,
-    wake: Notify,
+    reconciliation_cursor: AtomicUsize,
     jobs: Mutex<HashMap<String, Job>>,
     quotes: Mutex<HashMap<String, Quote>>,
     credential_gate: Mutex<()>,
@@ -323,13 +307,20 @@ pub struct OfflineManager {
     journal: Arc<std::sync::Mutex<GenerationJournal>>,
     queue: WorkQueue,
     tasks: Arc<Tasks>,
+    mutation_tasks: Arc<Tasks>,
+    final_saves: Arc<Tasks>,
     chapter_plans: Arc<PlanCache<plans::ChapterPlan>>,
     edition_plans: Arc<PlanCache<EditionPlan>>,
     manifest_plans: Arc<PlanCache<OfflineManifest>>,
     planner: SharedPlanner,
-    plan_gate: Mutex<()>,
+    plan_gate: Arc<Mutex<()>>,
+    event_handle: std::sync::Mutex<Option<tauri::AppHandle>>,
     #[cfg(test)]
     chapter_builds: Arc<AtomicUsize>,
+    #[cfg(test)]
+    coalesced_waiters: Arc<AtomicUsize>,
+    #[cfg(test)]
+    coalesced_signal: Arc<Notify>,
     #[cfg(test)]
     test_provider: Option<Arc<crate::test_provider::MockSpeech>>,
 }
@@ -343,11 +334,11 @@ impl OfflineManager {
         Ok(Arc::new(Self {
             store,
             cache: Arc::new(AudioCache::new(root.clone()).map_err(|e| e.to_string())?),
-            speech: SpeechService::new(root).map_err(|e| e.to_string())?,
+            speech: Arc::new(SpeechService::new(root).map_err(|e| e.to_string())?),
             gate: Mutex::new(()),
             interactive: AtomicUsize::new(0),
             credential_generation: AtomicU64::new(0),
-            wake: Notify::new(),
+            reconciliation_cursor: AtomicUsize::new(0),
             jobs: Mutex::new(HashMap::new()),
             quotes: Mutex::new(HashMap::new()),
             credential_gate: Mutex::new(()),
@@ -355,27 +346,97 @@ impl OfflineManager {
             journal: Arc::new(std::sync::Mutex::new(journal)),
             queue: WorkQueue::default(),
             tasks: Tasks::new(),
+            mutation_tasks: Tasks::new(),
+            final_saves: Tasks::new(),
             chapter_plans: Arc::new(PlanCache::new(256 * 1024 * 1024)),
             edition_plans: Arc::new(PlanCache::new(256 * 1024 * 1024)),
             manifest_plans: Arc::new(PlanCache::new(16 * 1024 * 1024)),
             planner: Arc::new(std::sync::Mutex::new(None)),
-            plan_gate: Mutex::new(()),
+            plan_gate: Arc::new(Mutex::new(())),
+            event_handle: std::sync::Mutex::new(None),
             #[cfg(test)]
             chapter_builds: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            coalesced_waiters: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            coalesced_signal: Arc::new(Notify::new()),
             #[cfg(test)]
             test_provider: None,
         }))
     }
+    pub(crate) fn set_event_handle(&self, handle: tauri::AppHandle) {
+        if let Ok(mut event_handle) = self.event_handle.lock() {
+            *event_handle = Some(handle);
+        }
+    }
+    async fn emit_status(&self, book_id: &str) {
+        let handle = self
+            .event_handle
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(handle) = handle
+            && let Ok(status) = self.status(book_id).await
+        {
+            let _ = handle.emit("offline-status-changed", status);
+        }
+    }
     pub(crate) fn begin_shutdown(&self) {
         self.queue.close();
         self.tasks.close();
+        self.mutation_tasks.close();
+    }
+    pub(crate) fn mutation_permit(&self) -> IpcResult<crate::tasks::TaskPermit> {
+        self.mutation_tasks
+            .enter()
+            .ok_or_else(|| "Приложение закрывается".into())
+    }
+    pub(crate) async fn drain_mutations(&self) {
+        self.final_saves.close();
+        self.mutation_tasks.wait().await;
+        self.final_saves.wait().await;
+    }
+    pub(crate) fn final_save_permit(&self) -> IpcResult<crate::tasks::TaskPermit> {
+        self.final_saves
+            .enter()
+            .ok_or_else(|| "Приложение закрывается".into())
+    }
+    pub(crate) async fn run_mutation<T: Send + 'static>(
+        &self,
+        operation: impl std::future::Future<Output = IpcResult<T>> + Send + 'static,
+    ) -> IpcResult<T> {
+        let permit = self.mutation_permit()?;
+        tauri::async_runtime::spawn(async move {
+            let _permit = permit;
+            operation.await
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+    async fn invalidate_under_store(&self) -> IpcResult<()> {
+        let store = Arc::clone(&self.store);
+        let chapter = Arc::clone(&self.chapter_plans);
+        let edition = Arc::clone(&self.edition_plans);
+        let manifests = Arc::clone(&self.manifest_plans);
+        tauri::async_runtime::spawn_blocking(move || {
+            let _store = store.lock().map_err(|e| e.to_string())?;
+            chapter.invalidate();
+            edition.invalidate();
+            manifests.invalidate();
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
     pub(crate) async fn shutdown(&self) {
         self.begin_shutdown();
         {
             let mut jobs = self.jobs.lock().await;
-            for job in jobs.values_mut().filter(|job| job.state == "running") {
-                job.state = "paused";
+            for job in jobs
+                .values_mut()
+                .filter(|job| job.state == OfflineJobState::Running)
+            {
+                job.state = OfflineJobState::Paused;
                 job.generation = job.generation.wrapping_add(1);
             }
         }
@@ -397,10 +458,11 @@ impl OfflineManager {
     async fn book_and_profile(&self, id: String, offline: bool) -> IpcResult<(Book, AudioProfile)> {
         let store = Arc::clone(&self.store);
         let cache = Arc::clone(&self.cache);
+        let speech = Arc::clone(&self.speech);
         tauri::async_runtime::spawn_blocking(move || {
             let store = store.lock().map_err(|e| e.to_string())?;
             let book = store.book(&id).map_err(|e| e.to_string())?;
-            let profile = if offline {
+            let mut profile = if offline {
                 cache
                     .list_manifests()
                     .map_err(|e| e.to_string())?
@@ -411,10 +473,30 @@ impl OfflineManager {
             } else {
                 AudioProfile::from_preferences(&store.preferences().map_err(|e| e.to_string())?)
             };
+            drop(store);
+            if !offline {
+                Self::resolve_resource_revision(&speech, &mut profile)?;
+            }
             Ok((book, profile))
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+
+    fn resolve_resource_revision(
+        speech: &SpeechService,
+        profile: &mut AudioProfile,
+    ) -> IpcResult<()> {
+        if profile.engine == "piper" {
+            let revision = speech
+                .piper_resource_revision(&profile.voice)
+                .map_err(|e| e.to_string())?;
+            profile
+                .synthesis
+                .get_or_insert_with(Default::default)
+                .resource_revision = Some(revision);
+        }
+        Ok(())
     }
     async fn manifests(&self) -> IpcResult<Vec<OfflineManifest>> {
         let cache = Arc::clone(&self.cache);
@@ -435,6 +517,7 @@ impl OfflineManager {
         .await
         .map_err(|e| e.to_string())?
     }
+    #[allow(clippy::too_many_lines)] // Status combines cache state and durable provider accounting.
     async fn status(&self, book_id: &str) -> IpcResult<OfflineStatus> {
         let manifest = self
             .manifests()
@@ -457,11 +540,16 @@ impl OfflineManager {
             return Ok(OfflineStatus {
                 book_id: book_id.into(),
                 profile_id: None,
-                state: "none",
+                state: OfflineJobState::None,
                 total_blocks: 0,
                 cached_blocks: 0,
                 bytes: 0,
                 error: None,
+                pending_requests: 0,
+                actual_cost_usd: None,
+                estimated_reserved_usd: None,
+                unknown_cost_requests: 0,
+                submitted_requests: 0,
             });
         };
         let cache = Arc::clone(&self.cache);
@@ -485,15 +573,63 @@ impl OfflineManager {
             .await
             .map_err(|e| e.to_string())??;
         let job = self.jobs.lock().await.get(book_id).cloned();
+        let history_ids = manifest.block_ids.clone();
+        let attempts = self
+            .journal(move |journal| journal.attempts_for_blocks(&history_ids))
+            .await?;
+        let mut costs: HashMap<String, Option<String>> = HashMap::new();
+        let mut missing_ids = 0_usize;
+        let mut submitted_history = 0_usize;
+        for attempt in attempts {
+            if attempt.state == GenerationState::Prepared {
+                continue;
+            }
+            submitted_history = submitted_history.saturating_add(1);
+            if let Some(id) = attempt.provider_response_id {
+                let entry = costs.entry(id).or_insert(None);
+                if attempt.provider_cost.is_some() {
+                    *entry = attempt.provider_cost;
+                }
+            } else {
+                missing_ids = missing_ids.saturating_add(1);
+            }
+        }
+        let mut historical_cost = None::<String>;
+        let mut historical_unknown = missing_ids;
+        for cost in costs.into_values() {
+            if let Some(cost) = cost {
+                historical_cost = Some(
+                    decimal_add(historical_cost.as_deref().unwrap_or("0"), &cost)
+                        .ok_or("Не удалось точно сложить историю расходов")?,
+                );
+            } else {
+                historical_unknown = historical_unknown.saturating_add(1);
+            }
+        }
         let missing_after_completion = cached_blocks != manifest.block_ids.len()
-            && job.as_ref().is_some_and(|job| job.state == "complete");
-        let state = if cached_blocks == manifest.block_ids.len() {
-            "complete"
+            && job
+                .as_ref()
+                .is_some_and(|job| job.state == OfflineJobState::Complete);
+        let state = if job
+            .as_ref()
+            .is_some_and(|job| job.state == OfflineJobState::Running)
+        {
+            OfflineJobState::Running
+        } else if cached_blocks == manifest.block_ids.len() {
+            OfflineJobState::Complete
         } else if missing_after_completion {
-            "error"
+            OfflineJobState::Error
         } else {
-            job.as_ref().map_or("paused", |job| job.state)
+            job.as_ref()
+                .map_or(OfflineJobState::Paused, |job| job.state)
         };
+        let accounting = job.as_ref().and_then(|job| job.budget.as_ref());
+        let actual_cost_usd = historical_cost;
+        let estimated_reserved_usd = accounting
+            .and_then(|budget| budget.reserved.as_ref().map(|(_, value)| value.clone()))
+            .filter(|value| !value.is_empty());
+        let unknown_cost_requests = historical_unknown;
+        let submitted_requests = submitted_history;
         Ok(OfflineStatus {
             book_id: book_id.into(),
             profile_id: Some(manifest.profile_id),
@@ -506,11 +642,28 @@ impl OfflineManager {
             } else {
                 job.and_then(|j| j.error)
             },
+            pending_requests: self.queue.pending_for_book(book_id),
+            actual_cost_usd,
+            estimated_reserved_usd,
+            unknown_cost_requests,
+            submitted_requests,
         })
     }
     async fn price(&self, profile: &AudioProfile) -> IpcResult<(Option<Price>, bool)> {
         if profile.engine != "openrouter" {
             return Ok((None, true));
+        }
+        #[cfg(test)]
+        if let Some(provider) = &self.test_provider {
+            let (prompt, completion, free) = provider.price();
+            return Ok((
+                Some(Price {
+                    prompt,
+                    completion,
+                    other: std::collections::BTreeMap::default(),
+                }),
+                free,
+            ));
         }
         let model = profile
             .model
@@ -543,7 +696,10 @@ impl OfflineManager {
         let _credentials = self.credential_gate.lock().await;
         let job_generation = {
             let jobs = self.jobs.lock().await;
-            if jobs.get(&book_id).is_some_and(|job| job.state == "running") {
+            if jobs
+                .get(&book_id)
+                .is_some_and(|job| job.state == OfflineJobState::Running)
+            {
                 return Err("Сначала приостановите загрузку".into());
             }
             jobs.get(&book_id).map_or(0, |job| job.generation)
@@ -566,40 +722,12 @@ impl OfflineManager {
         let journal = Arc::clone(&self.journal);
         let (block_ids, cached_blocks, characters, text_bytes, retry_attempts) =
             tauri::async_runtime::spawn_blocking(move || -> IpcResult<_> {
-                let mut ids = Vec::new();
-                let mut cached = 0;
-                let mut chars = 0_usize;
-                let mut bytes = 0_usize;
-                let mut missing = HashSet::new();
-                let mut retry_attempts = HashMap::new();
-                let journal = journal.lock().map_err(|e| e.to_string())?;
-                for chapter in &plan_copy.chapters {
-                    for block in &chapter.blocks {
-                        if cache
-                            .verify(&block.id)
-                            .map_err(|e| e.to_string())?
-                            .is_some()
-                        {
-                            cached += 1;
-                        } else if missing.insert(block.id.clone()) {
-                            chars = chars.saturating_add(block.characters);
-                            bytes = bytes.saturating_add(block.text.len());
-                            if profile_copy.engine == "openrouter"
-                                && let Some(attempt) = journal
-                                    .latest(block, &profile_copy)
-                                    .map_err(|e| e.to_string())?
-                                && matches!(
-                                    attempt.state,
-                                    GenerationState::Uncertain | GenerationState::Completed
-                                )
-                            {
-                                retry_attempts.insert(block.id.clone(), attempt.id);
-                            }
-                        }
-                        ids.push(block.id.clone());
-                    }
-                }
-                Ok((ids, cached, chars, bytes, retry_attempts))
+                scan_quote(&plan_copy, &profile_copy, &journal, |id| {
+                    cache
+                        .verify(id)
+                        .map(|entry| entry.is_some())
+                        .map_err(|e| e.to_string())
+                })
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -655,6 +783,12 @@ impl OfflineManager {
             retry_required_blocks: quote.retry_attempts.len(),
             characters: quote.characters,
             pricing: quote.pricing.clone(),
+            pricing_source: quote.pricing.as_ref().map(|_| "openrouter_api"),
+            pricing_verified_at: quote.pricing.as_ref().map(|_| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |v| v.as_millis().try_into().unwrap_or(u64::MAX))
+            }),
             estimated_cost: estimate.amount,
             billable_units: estimate.units,
             cost_unit: estimate.unit,
@@ -700,17 +834,44 @@ impl OfflineManager {
         book_id: String,
         quote_id: String,
         confirm_retries: bool,
-    ) -> IpcResult<OfflineStatus> {
+        budget: OfflineBudget,
+    ) -> BlockResult<OfflineStatus> {
         let permit = self.tasks.enter().ok_or("Приложение закрывается")?;
         let _credentials = self.credential_gate.lock().await;
-        let quote = self
-            .quotes
-            .lock()
-            .await
-            .remove(&quote_id)
-            .ok_or_else(|| "Стоимость устарела; запросите оценку снова".to_owned())?;
+        let quote =
+            self.quotes.lock().await.remove(&quote_id).ok_or_else(|| {
+                BlockError::stale_quote("Стоимость устарела; запросите оценку снова")
+            })?;
+        if budget
+            .max_cost_usd
+            .as_ref()
+            .is_some_and(|value| parse_decimal(value).is_none())
+        {
+            return Err("Некорректный денежный лимит".into());
+        }
+        if quote.manifest.profile.engine == "openrouter" && quote.characters != 0 {
+            if budget.max_new_blocks.is_none_or(|limit| limit == 0) {
+                return Err("Укажите максимальное число новых запросов".into());
+            }
+            if cost(&quote).amount.is_none() && !budget.allow_unknown_cost {
+                return Err("Подтвердите загрузку с неизвестной стоимостью".into());
+            }
+            if cost(&quote).amount.is_none() && budget.max_cost_usd.is_some() {
+                return Err("Денежный лимит нельзя применить без оценки стоимости запроса".into());
+            }
+            if budget.max_cost_usd.is_some()
+                && self.status(&book_id).await?.unknown_cost_requests > 0
+            {
+                return Err("Сначала проверьте неизвестный расход предыдущих запросов".into());
+            }
+        }
+        if self.queue.pending_for_book(&book_id) != 0 {
+            return Err("Дождитесь завершения отправленного запроса".into());
+        }
         if quote.manifest.book_id != book_id || quote.expires <= Instant::now() {
-            return Err("Стоимость устарела; запросите оценку снова".into());
+            return Err(BlockError::stale_quote(
+                "Стоимость устарела; запросите оценку снова",
+            ));
         }
         if !quote.retry_attempts.is_empty() && !confirm_retries {
             return Err("Подтвердите повтор ранее отправленных запросов".into());
@@ -718,7 +879,9 @@ impl OfflineManager {
         if quote.characters != 0 {
             let (pricing, free) = self.price(&quote.manifest.profile).await?;
             if !price_matches(&quote, pricing.as_ref(), free) {
-                return Err("Тариф изменился; запросите оценку снова".into());
+                return Err(BlockError::stale_quote(
+                    "Тариф изменился; запросите оценку снова",
+                ));
             }
         }
         let _plan_lifecycle = self.plan_gate.lock().await;
@@ -733,16 +896,25 @@ impl OfflineManager {
             manifest.plan_digest != quote.manifest.plan_digest
                 || manifest.block_ids != quote.manifest.block_ids
         }) {
-            return Err("Офлайн-издание изменилось; запросите оценку снова".into());
+            return Err(BlockError::stale_quote(
+                "Офлайн-издание изменилось; запросите оценку снова",
+            ));
         }
         if !existing && profile != quote.manifest.profile {
-            return Err("Настройки озвучивания изменились; запросите оценку снова".into());
+            return Err(BlockError::stale_quote(
+                "Настройки озвучивания изменились; запросите оценку снова",
+            ));
         }
         let mut jobs = self.jobs.lock().await;
         if jobs.get(&book_id).map_or(0, |job| job.generation) != quote.job_generation {
-            return Err("Состояние загрузки изменилось; запросите оценку снова".into());
+            return Err(BlockError::stale_quote(
+                "Состояние загрузки изменилось; запросите оценку снова",
+            ));
         }
-        if jobs.get(&book_id).is_some_and(|j| j.state == "running") {
+        if jobs
+            .get(&book_id)
+            .is_some_and(|j| j.state == OfflineJobState::Running)
+        {
             return Err("Загрузка уже выполняется".into());
         }
         let cache = Arc::clone(&self.cache);
@@ -803,7 +975,9 @@ impl OfflineManager {
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
             }
-            return Err("Текст книги или кеш изменились; запросите оценку снова".into());
+            return Err(BlockError::stale_quote(
+                "Текст книги или кеш изменились; запросите оценку снова",
+            ));
         }
         let generation = jobs
             .get(&book_id)
@@ -814,10 +988,20 @@ impl OfflineManager {
         jobs.insert(
             book_id.clone(),
             Job {
-                state: "running",
+                state: OfflineJobState::Running,
                 error: None,
                 generation,
                 engine: quote.manifest.profile.engine.clone(),
+                budget: Some(BudgetState {
+                    limits: budget.clone(),
+                    pricing: quote.pricing.clone(),
+                    free: quote.free,
+                    billing_unit: quote.billing_unit,
+                    submitted: 0,
+                    actual: "0".into(),
+                    reserved: None,
+                    unknown: 0,
+                }),
             },
         );
         drop(jobs);
@@ -833,12 +1017,12 @@ impl OfflineManager {
                 worker
                     .worker(OfflineWork {
                         book_id: worker_id,
-                        plan: quote.plan,
-                        profile: quote.manifest.profile,
+                        plan: Arc::clone(&quote.plan),
+                        profile: quote.manifest.profile.clone(),
                         generation,
                         started_at,
                         allowed,
-                        retry_attempts: quote.retry_attempts,
+                        retry_attempts: quote.retry_attempts.clone(),
                     })
                     .await;
             })
@@ -848,16 +1032,19 @@ impl OfflineManager {
                 if let Some(job) = jobs.get_mut(&id)
                     && job.generation == generation
                 {
-                    job.state = "error";
+                    job.state = OfflineJobState::Error;
                     job.error =
                         Some("Загрузка завершилась аварийно; запросите новый расчёт".into());
                 }
                 manager.queue.stop_offline(&id, generation);
                 drop(jobs);
             }
+            manager.emit_status(&id).await;
         });
-        self.status(&book_id).await
+        self.emit_status(&book_id).await;
+        self.status(&book_id).await.map_err(Into::into)
     }
+    #[allow(clippy::too_many_lines, clippy::single_match_else)] // The worker owns sequential budget and state transitions.
     async fn worker(self: Arc<Self>, work: OfflineWork) {
         let OfflineWork {
             book_id,
@@ -876,10 +1063,9 @@ impl OfflineManager {
                 }
                 {
                     let jobs = self.jobs.lock().await;
-                    if !jobs
-                        .get(&book_id)
-                        .is_some_and(|j| j.generation == generation && j.state == "running")
-                    {
+                    if !jobs.get(&book_id).is_some_and(|j| {
+                        j.generation == generation && j.state == OfflineJobState::Running
+                    }) {
                         return;
                     }
                     sequence = sequence.saturating_add(1);
@@ -903,29 +1089,122 @@ impl OfflineManager {
                         consent,
                     )
                     .await;
+                self.emit_status(&book_id).await;
                 if let Err(error) = result {
                     let mut jobs = self.jobs.lock().await;
                     if let Some(job) = jobs.get_mut(&book_id)
                         && job.generation == generation
-                        && job.state == "running"
+                        && job.state == OfflineJobState::Running
                     {
-                        job.state = "error";
+                        if let Some(budget) = &mut job.budget
+                            && budget
+                                .reserved
+                                .as_ref()
+                                .is_some_and(|(id, _)| id == &block.id)
+                        {
+                            budget.unknown = budget.unknown.saturating_add(1);
+                        }
+                        job.state = OfflineJobState::Error;
                         job.error = Some(error.message);
                         self.queue.stop_offline(&book_id, generation);
                     }
                     drop(jobs);
                     return;
                 }
+                if profile.engine == "openrouter" {
+                    let reserved = self
+                        .jobs
+                        .lock()
+                        .await
+                        .get(&book_id)
+                        .and_then(|job| job.budget.as_ref())
+                        .and_then(|budget| budget.reserved.as_ref())
+                        .is_some_and(|(id, _)| id == &block.id);
+                    if reserved {
+                        let usage = self.reconcile_cost(block.clone(), profile.clone()).await;
+                        let mut jobs = self.jobs.lock().await;
+                        if let Some(job) = jobs.get_mut(&book_id)
+                            && job.generation == generation
+                            && let Some(budget) = &mut job.budget
+                        {
+                            match usage {
+                                Ok(value) => {
+                                    if let Some(sum) = decimal_add(&budget.actual, &value) {
+                                        budget.actual = sum;
+                                        budget.reserved = None;
+                                    } else {
+                                        budget.unknown += 1;
+                                        job.state = OfflineJobState::Paused;
+                                        job.error = Some("Не удалось точно сложить расход".into());
+                                    }
+                                }
+                                Err(_) => {
+                                    budget.unknown += 1;
+                                    if budget.limits.max_cost_usd.is_some() {
+                                        job.state = OfflineJobState::Paused;
+                                        job.error = Some("Расход запроса ещё неизвестен; проверьте его перед продолжением".into());
+                                    }
+                                }
+                            }
+                            if job.state != OfflineJobState::Running {
+                                self.queue.stop_offline(&book_id, generation);
+                            }
+                        }
+                        drop(jobs);
+                        self.emit_status(&book_id).await;
+                    }
+                }
             }
         }
         let mut jobs = self.jobs.lock().await;
         if let Some(job) = jobs.get_mut(&book_id)
             && job.generation == generation
-            && job.state == "running"
+            && job.state == OfflineJobState::Running
         {
-            job.state = "complete";
+            job.state = OfflineJobState::Complete;
             self.queue.stop_offline(&book_id, generation);
         }
+    }
+    async fn reconcile_cost(&self, block: AudioBlock, profile: AudioProfile) -> IpcResult<String> {
+        let attempt = self
+            .journal(move |journal| journal.latest(&block, &profile))
+            .await?
+            .ok_or("Нет записи о запросе")?;
+        self.reconcile_attempt(attempt).await
+    }
+    async fn reconcile_attempt(&self, attempt: desk_core::GenerationAttempt) -> IpcResult<String> {
+        if let Some(cost) = attempt.provider_cost {
+            return Ok(cost);
+        }
+        let id = attempt
+            .provider_response_id
+            .ok_or("Поставщик не сообщил ID запроса")?;
+        #[cfg(test)]
+        if let Some(provider) = &self.test_provider {
+            let cost = provider.usage(&id)?;
+            let attempt_id = attempt.id;
+            let saved_cost = cost.clone();
+            self.journal(move |journal| journal.note_cost(&attempt_id, &saved_cost))
+                .await?;
+            return Ok(cost);
+        }
+        let key = tauri::async_runtime::spawn_blocking(credentials::read)
+            .await
+            .map_err(|e| e.to_string())??
+            .ok_or("Добавьте ключ OpenRouter в настройках")?;
+        let cost = self
+            .speech
+            .openrouter_generation_cost(&key, &id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if parse_decimal(&cost).is_none() {
+            return Err("Поставщик сообщил некорректный расход".into());
+        }
+        let attempt_id = attempt.id;
+        let saved_cost = cost.clone();
+        self.journal(move |journal| journal.note_cost(&attempt_id, &saved_cost))
+            .await?;
+        Ok(cost)
     }
     async fn cached(&self, id: String) -> IpcResult<Option<SpeechAudio>> {
         let cache = Arc::clone(&self.cache);
@@ -935,14 +1214,14 @@ impl OfflineManager {
                 cache: Arc::clone(&cache),
                 id: id.clone(),
             };
-            let Some(entry) = cache.get(&id).map_err(|e| e.to_string())? else {
+            let Some(entry) = cache.get_bytes(&id).map_err(|e| e.to_string())? else {
                 return Ok(None);
             };
-            let bytes = std::fs::read(entry.path).map_err(|e| e.to_string())?;
             Ok(Some(SpeechAudio {
-                data: STANDARD.encode(bytes),
+                data: STANDARD.encode(entry.data),
                 mime: entry.mime,
                 playback_rate: 1.0,
+                timings: Vec::new(),
             }))
         })
         .await
@@ -1014,7 +1293,9 @@ impl OfflineManager {
         }
         let block = block.clone();
         let profile = profile.clone();
+        let permit = self.mutation_permit()?;
         self.journal(move |journal| {
+            let _permit = permit;
             if let Some(attempt) = journal.latest(&block, &profile)?
                 && attempt.state == GenerationState::Uncertain
             {
@@ -1047,6 +1328,11 @@ impl OfflineManager {
             inflight.remove(&id);
         }
         let mut receiver = if let Some(receiver) = inflight.get(&id) {
+            #[cfg(test)]
+            {
+                self.coalesced_waiters.fetch_add(1, Ordering::SeqCst);
+                self.coalesced_signal.notify_waiters();
+            }
             receiver.clone()
         } else {
             if inflight.len() >= 1024 {
@@ -1099,6 +1385,7 @@ impl OfflineManager {
                         data: audio.data.clone(),
                         mime: audio.mime.clone(),
                         playback_rate: audio.playback_rate,
+                        timings: audio.timings.clone(),
                     })),
                     InflightResult::Failed(error, _) => Err(error),
                     InflightResult::Paused => Ok(None),
@@ -1110,6 +1397,7 @@ impl OfflineManager {
                 .map_err(|_| "Задача озвучивания прервана".to_owned())?;
         }
     }
+    #[allow(clippy::too_many_lines)] // Resource revision is checked around synthesis and cache write.
     async fn produce_block(
         &self,
         block: AudioBlock,
@@ -1149,23 +1437,43 @@ impl OfflineManager {
                 cache: Arc::clone(&cache),
                 id: id.clone(),
             };
-            let hit = cache.get(&id).map_err(|e| e.to_string())?;
+            let hit = cache.get_bytes(&id).map_err(|e| e.to_string())?;
             Ok((hit, pin))
         })
         .await
         .map_err(|e| e.to_string())??;
         if let Some(hit) = hit {
-            let data = tokio::fs::read(hit.path).await.map_err(|e| e.to_string())?;
             return Ok(Some(SpeechAudio {
-                data: STANDARD.encode(data),
+                data: STANDARD.encode(hit.data),
                 mime: hit.mime,
                 playback_rate: 1.0,
+                timings: Vec::new(),
             }));
         }
         let audio = if profile.engine == "openrouter" {
             self.generate_openrouter(&block, &profile, credential_generation, confirmed_attempt)
                 .await?
         } else {
+            if profile.engine == "piper" {
+                let expected = profile
+                    .synthesis
+                    .as_ref()
+                    .and_then(|s| s.resource_revision.clone())
+                    .ok_or(
+                        "Для старой версии Piper нельзя безопасно создать недостающий фрагмент",
+                    )?;
+                let speech = Arc::clone(&self.speech);
+                let voice = profile.voice.clone();
+                let actual = tauri::async_runtime::spawn_blocking(move || {
+                    speech.piper_resource_revision(&voice)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+                if actual != expected {
+                    return Err("Файлы Piper изменились; создайте новое издание".into());
+                }
+            }
             if !self.queue.try_submit(&block.id) {
                 return Ok(None);
             }
@@ -1178,20 +1486,53 @@ impl OfflineManager {
                 .synthesize_exact(&block.text, Some(&profile.voice), 1.0)
                 .await
                 .map_err(|e| e.to_string())?;
-            self.save_audio(&block.id, &audio).await?;
+            if profile.engine == "piper" {
+                let speech = Arc::clone(&self.speech);
+                let voice = profile.voice.clone();
+                let expected = profile
+                    .synthesis
+                    .as_ref()
+                    .and_then(|s| s.resource_revision.clone());
+                let actual = tauri::async_runtime::spawn_blocking(move || {
+                    speech.piper_resource_revision(&voice)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+                if Some(actual) != expected {
+                    return Err("Файлы Piper изменились во время синтеза".into());
+                }
+            }
+            self.save_audio(&block, &audio).await?;
             Some(audio)
         };
         Ok(audio)
     }
-    async fn save_audio(&self, id: &str, audio: &SpeechAudio) -> BlockResult<()> {
+    async fn save_audio(&self, block: &AudioBlock, audio: &SpeechAudio) -> BlockResult<()> {
         let bytes = STANDARD
             .decode(&audio.data)
             .map_err(|_| "Некорректное аудио".to_owned())?;
         let cache = Arc::clone(&self.cache);
-        let id = id.to_owned();
+        let id = block.id.clone();
         let mime = audio.mime.clone();
+        let text_length = block.text.encode_utf16().count();
+        let timings = audio
+            .timings
+            .iter()
+            .map(|mark| desk_core::AudioTiming {
+                start_utf16: mark.start_utf16,
+                end_utf16: mark.end_utf16,
+                start_seconds: mark.start_seconds,
+                end_seconds: mark.end_seconds,
+            })
+            .collect::<Vec<_>>();
+        if timings.iter().any(|mark| mark.end_utf16 > text_length) {
+            return Err("Метки синтеза выходят за границы текста".into());
+        }
         tauri::async_runtime::spawn_blocking(move || -> IpcResult<()> {
-            cache.put(&id, &mime, &bytes).map_err(|e| e.to_string())?;
+            cache
+                .put_with_timings(&id, &mime, &bytes, &timings)
+                .map_err(|e| e.to_string())?;
             if cache.verify(&id).map_err(|e| e.to_string())?.is_none() {
                 return Err("Не удалось проверить сохранённое аудио".into());
             }
@@ -1226,6 +1567,7 @@ impl OfflineManager {
                 profile.model_voice.as_deref(),
                 1.0,
                 self.speech.cancellation_generation(),
+                crate::transport_for(profile.synthesis.as_ref()),
                 callback,
             )
             .await
@@ -1255,6 +1597,7 @@ impl OfflineManager {
             }
         }
     }
+    #[allow(clippy::too_many_lines)] // Submission, budget reservation and journal transitions form one transaction boundary.
     async fn generate_openrouter(
         &self,
         block: &AudioBlock,
@@ -1283,6 +1626,9 @@ impl OfflineManager {
             .await
             .map_err(|e| e.to_string())??;
         let key = key.ok_or("Добавьте ключ OpenRouter в настройках")?;
+        crate::transport_for(profile.synthesis.as_ref())
+            .validate()
+            .map_err(|e| e.to_string())?;
         self.speech
             .validate_openrouter_request(
                 &block.text,
@@ -1296,6 +1642,73 @@ impl OfflineManager {
             .prepare_attempt(block, profile, confirmed_attempt)
             .await?;
         if !self.queue.try_submit(&block.id) {
+            self.journal(move |journal| journal.return_to_prepared(&attempt.id))
+                .await?;
+            return Ok(None);
+        }
+        let owners = self.queue.submitted_books(&block.id);
+        let mut reserved_books = Vec::new();
+        {
+            let mut jobs = self.jobs.lock().await;
+            for book in owners {
+                let Some(job) = jobs.get_mut(&book) else {
+                    continue;
+                };
+                let Some(budget) = &mut job.budget else {
+                    continue;
+                };
+                if job.state != OfflineJobState::Running {
+                    continue;
+                }
+                let estimate = estimate_cost(
+                    budget.pricing.as_ref(),
+                    budget.free,
+                    budget.billing_unit,
+                    block.characters,
+                    block.text.len(),
+                )
+                .amount;
+                let over_count = budget
+                    .limits
+                    .max_new_blocks
+                    .is_some_and(|limit| budget.submitted >= limit);
+                let over_cost = budget.limits.max_cost_usd.as_ref().is_some_and(|limit| {
+                    estimate.as_deref().is_none_or(|amount| {
+                        !matches!(
+                            decimal_add_compare(&budget.actual, amount, limit),
+                            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                        )
+                    })
+                });
+                if over_count || over_cost || budget.reserved.is_some() {
+                    job.state = OfflineJobState::Paused;
+                    job.error = Some(
+                        "Достигнут лимит загрузки или предыдущий расход ещё неизвестен".into(),
+                    );
+                    self.queue.stop_offline(&book, job.generation);
+                } else {
+                    budget.submitted += 1;
+                    budget.reserved = Some((block.id.clone(), estimate.unwrap_or_default()));
+                    reserved_books.push(book);
+                }
+            }
+            drop(jobs);
+        }
+        if !self.queue.needs(&block.id) {
+            self.queue.complete(&block.id);
+            let mut jobs = self.jobs.lock().await;
+            for book in reserved_books {
+                if let Some(budget) = jobs.get_mut(&book).and_then(|job| job.budget.as_mut())
+                    && budget
+                        .reserved
+                        .as_ref()
+                        .is_some_and(|(id, _)| id == &block.id)
+                {
+                    budget.submitted = budget.submitted.saturating_sub(1);
+                    budget.reserved = None;
+                }
+            }
+            drop(jobs);
             self.journal(move |journal| journal.return_to_prepared(&attempt.id))
                 .await?;
             return Ok(None);
@@ -1328,7 +1741,7 @@ impl OfflineManager {
         };
         let outcome: BlockResult<SpeechAudio> = async {
             let audio = result.map_err(|e| e.to_string())?;
-            self.save_audio(&block.id, &audio).await?;
+            self.save_audio(block, &audio).await?;
             let attempt_id = attempt.id.clone();
             self.journal(move |journal| journal.complete(&attempt_id, None))
                 .await?;
@@ -1336,7 +1749,47 @@ impl OfflineManager {
         }
         .await;
         match outcome {
-            Ok(audio) => Ok(Some(audio)),
+            Ok(audio) => {
+                #[cfg(not(test))]
+                {
+                    let speech = Arc::clone(&self.speech);
+                    let journal = Arc::clone(&self.journal);
+                    let attempt_id = attempt.id.clone();
+                    let key = key.clone();
+                    if let Some(permit) = self.tasks.enter() {
+                        tauri::async_runtime::spawn(async move {
+                            let _permit = permit;
+                            let id_for_lookup = attempt_id.clone();
+                            let journal_for_lookup = Arc::clone(&journal);
+                            let record = tauri::async_runtime::spawn_blocking(move || {
+                                journal_for_lookup
+                                    .lock()
+                                    .ok()?
+                                    .attempt(&id_for_lookup)
+                                    .ok()
+                                    .flatten()
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            if let Some(record) = record
+                                && record.provider_cost.is_none()
+                                && let Some(response_id) = record.provider_response_id
+                                && let Ok(cost) =
+                                    speech.openrouter_generation_cost(&key, &response_id).await
+                            {
+                                let _ = tauri::async_runtime::spawn_blocking(move || {
+                                    if let Ok(journal) = journal.lock() {
+                                        let _ = journal.note_cost(&attempt_id, &cost);
+                                    }
+                                })
+                                .await;
+                            }
+                        });
+                    }
+                }
+                Ok(Some(audio))
+            }
             Err(error) => {
                 let attempt_id = attempt.id.clone();
                 self.journal(move |journal| journal.mark_uncertain(&attempt_id, None))
@@ -1356,35 +1809,44 @@ pub async fn audio_plan(
     book_id: String,
     chapter: usize,
     offline: bool,
-) -> IpcResult<AudioPlan> {
-    let manager = Arc::clone(&state.offline);
-    let (profile_id, blocks) = if offline {
-        let (manifest, plan) = manager.saved_edition(book_id).await?;
-        let chapter = plan.chapters.get(chapter).ok_or("Глава не найдена")?;
-        (
-            manifest.profile_id.clone(),
-            chapter.blocks.iter().map(AudioBlockInfo::from).collect(),
-        )
-    } else {
-        let (profile, plan) = manager.chapter_plan(book_id, chapter).await?;
-        (
-            profile.id(),
-            plan.blocks.iter().map(AudioBlockInfo::from).collect(),
-        )
-    };
-    Ok(AudioPlan {
-        profile_id,
-        blocks,
-        offline,
-    })
+) -> Result<AudioPlan, crate::ipc::IpcError> {
+    let result: IpcResult<_> = async {
+        let manager = Arc::clone(&state.offline);
+        let (profile_id, blocks) = if offline {
+            let (manifest, plan) = manager.saved_edition(book_id).await?;
+            let chapter = plan.chapters.get(chapter).ok_or("Глава не найдена")?;
+            (
+                manifest.profile_id.clone(),
+                chapter.blocks.iter().map(AudioBlockInfo::from).collect(),
+            )
+        } else {
+            let (profile, plan) = manager.chapter_plan(book_id, chapter).await?;
+            (
+                profile.id(),
+                plan.blocks.iter().map(AudioBlockInfo::from).collect(),
+            )
+        };
+        Ok(AudioPlan {
+            profile_id,
+            blocks,
+            offline,
+        })
+    }
+    .await;
+    result.map_err(Into::into)
 }
 #[tauri::command]
-pub async fn audio_session(state: State<'_, AppState>) -> IpcResult<String> {
-    state
-        .offline
-        .queue
-        .open_playback_session()
-        .ok_or_else(|| "Приложение закрывается".into())
+pub async fn audio_session(state: State<'_, AppState>) -> Result<String, crate::ipc::IpcError> {
+    let result: IpcResult<_> = async {
+        state.audio_resources.clear();
+        state
+            .offline
+            .queue
+            .open_playback_session()
+            .ok_or_else(|| "Приложение закрывается".into())
+    }
+    .await;
+    result.map_err(Into::into)
 }
 #[tauri::command]
 pub async fn audio_interest(
@@ -1392,19 +1854,23 @@ pub async fn audio_interest(
     session: String,
     revision: u64,
     block_ids: Vec<String>,
-) -> IpcResult<bool> {
-    if session.len() > 64
-        || block_ids.len() > 2
-        || block_ids
-            .iter()
-            .any(|id| id.len() != 64 || !id.bytes().all(|c| c.is_ascii_hexdigit()))
-    {
-        return Err("Некорректный интерес к аудиоблокам".into());
+) -> Result<bool, crate::ipc::IpcError> {
+    let result: IpcResult<_> = async {
+        if session.len() > 64
+            || block_ids.len() > 2
+            || block_ids
+                .iter()
+                .any(|id| id.len() != 64 || !id.bytes().all(|c| c.is_ascii_hexdigit()))
+        {
+            return Err("Некорректный интерес к аудиоблокам".into());
+        }
+        Ok(state
+            .offline
+            .queue
+            .update_playback(&session, revision, block_ids.into_iter().collect()))
     }
-    Ok(state
-        .offline
-        .queue
-        .update_playback(&session, revision, block_ids.into_iter().collect()))
+    .await;
+    result.map_err(Into::into)
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1419,11 +1885,20 @@ pub struct AudioBlockRequest {
     revision: u64,
     confirmed_attempt: Option<String>,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioBlockResponse {
+    resource_id: String,
+    mime: String,
+    playback_rate: f32,
+    timings: Vec<desk_core::AudioTiming>,
+}
 #[tauri::command]
+#[allow(clippy::too_many_lines)] // Validates session, source and resource lease in one operation.
 pub async fn audio_block(
     state: State<'_, AppState>,
     request: AudioBlockRequest,
-) -> BlockResult<SpeechAudio> {
+) -> BlockResult<AudioBlockResponse> {
     let AudioBlockRequest {
         book_id,
         chapter,
@@ -1466,31 +1941,45 @@ pub async fn audio_block(
     {
         return Err(BlockError::cancelled());
     }
-    if offline {
+    {
         let cache = Arc::clone(&manager.cache);
         let id = block.id.clone();
-        let audio = tauri::async_runtime::spawn_blocking(move || -> IpcResult<_> {
+        let cached = tauri::async_runtime::spawn_blocking(move || -> IpcResult<_> {
             cache.pin_active(&id).map_err(|e| e.to_string())?;
             let _pin = ActivePin {
                 cache: Arc::clone(&cache),
                 id: id.clone(),
             };
-            let entry = cache
-                .get(&id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "Этот фрагмент ещё не загружен".to_owned())?;
-            let bytes = std::fs::read(&entry.path).map_err(|e| e.to_string())?;
-            Ok(SpeechAudio {
-                data: STANDARD.encode(bytes),
-                mime: entry.mime,
-                playback_rate: speed,
-            })
+            cache.get_bytes(&id).map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| e.to_string())??;
-        return Ok(audio);
+        if let Some(audio) = cached {
+            manager.repair_cached_attempt(&block, &profile).await?;
+            let resource_id = state
+                .audio_resources
+                .insert(audio.data, audio.mime.clone())?;
+            return Ok(AudioBlockResponse {
+                resource_id,
+                mime: audio.mime,
+                playback_rate: speed,
+                timings: audio.timings,
+            });
+        }
+        if offline {
+            return Err("Этот фрагмент ещё не загружен".into());
+        }
     }
-    let mut audio = manager
+    let block_id = block.id.clone();
+    manager
+        .cache
+        .pin_active(&block_id)
+        .map_err(|e| e.to_string())?;
+    let _pin = ActivePin {
+        cache: Arc::clone(&manager.cache),
+        id: block_id.clone(),
+    };
+    Arc::clone(&manager)
         .request_block(
             block,
             profile,
@@ -1500,20 +1989,103 @@ pub async fn audio_block(
         )
         .await?
         .ok_or_else(BlockError::cancelled)?;
-    audio.playback_rate = speed;
-    Ok(audio)
+    let cache = Arc::clone(&manager.cache);
+    let audio = tauri::async_runtime::spawn_blocking(move || cache.get_bytes(&block_id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
+        .ok_or("Сохранённый аудиоблок недоступен")?;
+    let resource_id = state
+        .audio_resources
+        .insert(audio.data, audio.mime.clone())?;
+    Ok(AudioBlockResponse {
+        resource_id,
+        mime: audio.mime,
+        playback_rate: speed,
+        timings: audio.timings,
+    })
 }
 #[tauri::command]
 pub async fn set_openrouter_billing_unit(
     state: State<'_, AppState>,
     model: String,
     unit: Option<BillingUnit>,
-) -> IpcResult<desk_core::Preferences> {
-    state.offline.set_billing_unit(model, unit).await
+) -> Result<desk_core::Preferences, crate::ipc::IpcError> {
+    let manager = Arc::clone(&state.offline);
+    let result = state
+        .offline
+        .run_mutation(async move { manager.set_billing_unit(model, unit).await })
+        .await;
+    result.map_err(Into::into)
 }
 #[tauri::command]
-pub async fn offline_quote(state: State<'_, AppState>, book_id: String) -> IpcResult<QuoteResult> {
-    state.offline.quote(book_id).await
+pub async fn offline_quote(
+    state: State<'_, AppState>,
+    book_id: String,
+) -> Result<QuoteResult, crate::ipc::IpcError> {
+    let result: IpcResult<_> = async { state.offline.quote(book_id).await }.await;
+    result.map_err(Into::into)
+}
+#[tauri::command]
+pub async fn reconcile_generation_cost(
+    state: State<'_, AppState>,
+    attempt_id: String,
+) -> Result<String, crate::ipc::IpcError> {
+    let manager = Arc::clone(&state.offline);
+    let result: IpcResult<_> = state
+        .offline
+        .run_mutation(async move {
+            let attempt = manager
+                .journal(move |journal| journal.attempt(&attempt_id))
+                .await?
+                .ok_or("Попытка генерации не найдена")?;
+            manager.reconcile_attempt(attempt).await
+        })
+        .await;
+    result.map_err(Into::into)
+}
+#[tauri::command]
+pub async fn reconcile_book_cost(
+    state: State<'_, AppState>,
+    book_id: String,
+) -> Result<OfflineStatus, crate::ipc::IpcError> {
+    let manager = Arc::clone(&state.offline);
+    let result = state
+        .offline
+        .run_mutation(async move { manager.reconcile_book_cost(&book_id).await })
+        .await;
+    result.map_err(Into::into)
+}
+impl OfflineManager {
+    async fn reconcile_book_cost(&self, book_id: &str) -> IpcResult<OfflineStatus> {
+        let manifest = self
+            .manifests()
+            .await?
+            .into_iter()
+            .find(|m| m.book_id == book_id)
+            .ok_or("Для книги нет офлайн-версии")?;
+        let ids = manifest.block_ids;
+        let attempts = self
+            .journal(move |journal| journal.attempts_for_blocks(&ids))
+            .await?;
+        let pending = attempts
+            .into_iter()
+            .filter(|attempt| {
+                attempt.provider_cost.is_none() && attempt.provider_response_id.is_some()
+            })
+            .collect::<Vec<_>>();
+        if !pending.is_empty() {
+            let start = self.reconciliation_cursor.fetch_add(20, Ordering::Relaxed) % pending.len();
+            for index in 0..pending.len().min(20) {
+                let attempt = pending[(start + index) % pending.len()].clone();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), self.reconcile_attempt(attempt))
+                        .await;
+            }
+        }
+        self.emit_status(book_id).await;
+        self.status(book_id).await
+    }
 }
 #[tauri::command]
 pub async fn offline_start(
@@ -1521,88 +2093,107 @@ pub async fn offline_start(
     book_id: String,
     quote_id: String,
     confirm_retries: Option<bool>,
-) -> IpcResult<OfflineStatus> {
-    state
-        .offline
-        .start(book_id, quote_id, confirm_retries.unwrap_or(false))
-        .await
+    budget: Option<OfflineBudget>,
+) -> BlockResult<OfflineStatus> {
+    let permit = state.offline.mutation_permit()?;
+    let manager = Arc::clone(&state.offline);
+    tauri::async_runtime::spawn(async move {
+        let _permit = permit;
+        manager
+            .start(
+                book_id,
+                quote_id,
+                confirm_retries.unwrap_or(false),
+                budget.unwrap_or_default(),
+            )
+            .await
+    })
+    .await
+    .map_err(|error| BlockError::from(error.to_string()))?
 }
 #[tauri::command]
 pub async fn offline_status(
     state: State<'_, AppState>,
     book_id: String,
-) -> IpcResult<OfflineStatus> {
-    state.offline.status(&book_id).await
+) -> Result<OfflineStatus, crate::ipc::IpcError> {
+    let result: IpcResult<_> = async { state.offline.status(&book_id).await }.await;
+    result.map_err(Into::into)
 }
 #[tauri::command]
 pub async fn offline_diagnostics(
     state: State<'_, AppState>,
-) -> IpcResult<Vec<desk_core::ManifestIssue>> {
-    state.offline.diagnostics().await
+) -> Result<Vec<desk_core::ManifestIssue>, crate::ipc::IpcError> {
+    let result: IpcResult<_> = async { state.offline.diagnostics().await }.await;
+    result.map_err(Into::into)
 }
 #[tauri::command]
 pub async fn offline_restore_manifest(
     state: State<'_, AppState>,
     file: String,
     backup_path: String,
-) -> IpcResult<()> {
-    let _permit = state
+) -> Result<(), crate::ipc::IpcError> {
+    let manager = Arc::clone(&state.offline);
+    let result: IpcResult<_> = state
         .offline
-        .tasks
-        .enter()
-        .ok_or("Приложение закрывается")?;
-    let _plan_lifecycle = state.offline.plan_gate.lock().await;
-    {
-        let mut jobs = state.offline.jobs.lock().await;
-        for (book_id, job) in jobs.iter_mut() {
-            state.offline.queue.stop_offline(book_id, job.generation);
-            job.state = "paused";
-            job.generation = job.generation.wrapping_add(1);
-        }
-    }
-    state.offline.quotes.lock().await.clear();
-    let cache = Arc::clone(&state.offline.cache);
-    let outcome = tauri::async_runtime::spawn_blocking(move || {
-        cache
-            .restore_manifest(&file, std::path::Path::new(&backup_path))
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    {
-        let _store = state.store.lock().map_err(|e| e.to_string())?;
-        state.offline.invalidate_plans();
-    }
-    outcome
+        .run_mutation(async move {
+            let _plan_lifecycle = manager.plan_gate.lock().await;
+            {
+                let mut jobs = manager.jobs.lock().await;
+                for (book_id, job) in jobs.iter_mut() {
+                    manager.queue.stop_offline(book_id, job.generation);
+                    job.state = OfflineJobState::Paused;
+                    job.generation = job.generation.wrapping_add(1);
+                }
+            }
+            manager.quotes.lock().await.clear();
+            let cache = Arc::clone(&manager.cache);
+            let outcome = tauri::async_runtime::spawn_blocking(move || {
+                cache
+                    .restore_manifest(&file, std::path::Path::new(&backup_path))
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string());
+            manager.invalidate_under_store().await?;
+            outcome?
+        })
+        .await;
+    result.map_err(Into::into)
 }
 #[tauri::command]
-pub async fn offline_list(state: State<'_, AppState>) -> IpcResult<Vec<OfflineStatus>> {
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
-    for manifest in state.offline.manifests().await? {
-        if seen.insert(manifest.book_id.clone()) {
-            let status = state
-                .offline
-                .status(&manifest.book_id)
-                .await
-                .unwrap_or_else(|error| {
-                    broken_status(manifest.book_id, Some(manifest.profile_id), error)
-                });
-            result.push(status);
+pub async fn offline_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<OfflineStatus>, crate::ipc::IpcError> {
+    let result: IpcResult<_> = async {
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for manifest in state.offline.manifests().await? {
+            if seen.insert(manifest.book_id.clone()) {
+                let status = state
+                    .offline
+                    .status(&manifest.book_id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        broken_status(manifest.book_id, Some(manifest.profile_id), error)
+                    });
+                result.push(status);
+            }
         }
-    }
-    for issue in state.offline.diagnostics().await? {
-        if let Some(book_id) = issue.book_id
-            && seen.insert(book_id.clone())
-        {
-            result.push(broken_status(
-                book_id,
-                issue.profile_id,
-                format!("Манифест издания повреждён: {}", issue.message),
-            ));
+        for issue in state.offline.diagnostics().await? {
+            if let Some(book_id) = issue.book_id
+                && seen.insert(book_id.clone())
+            {
+                result.push(broken_status(
+                    book_id,
+                    issue.profile_id,
+                    format!("Манифест издания повреждён: {}", issue.message),
+                ));
+            }
         }
+        Ok(result)
     }
-    Ok(result)
+    .await;
+    result.map_err(Into::into)
 }
 const fn broken_status(
     book_id: String,
@@ -1612,43 +2203,60 @@ const fn broken_status(
     OfflineStatus {
         book_id,
         profile_id,
-        state: "error",
+        state: OfflineJobState::Error,
         total_blocks: 0,
         cached_blocks: 0,
         bytes: 0,
         error: Some(error),
+        pending_requests: 0,
+        actual_cost_usd: None,
+        estimated_reserved_usd: None,
+        unknown_cost_requests: 0,
+        submitted_requests: 0,
     }
 }
 #[tauri::command]
 pub async fn offline_pause(
     state: State<'_, AppState>,
     book_id: String,
-) -> IpcResult<OfflineStatus> {
-    state.offline.pause(&book_id).await;
-    state.offline.status(&book_id).await
+) -> Result<OfflineStatus, crate::ipc::IpcError> {
+    let result: IpcResult<_> = async {
+        state.offline.pause(&book_id).await;
+        state.offline.status(&book_id).await
+    }
+    .await;
+    result.map_err(Into::into)
 }
 #[tauri::command]
 pub async fn offline_remove(
     state: State<'_, AppState>,
     book_id: String,
-) -> IpcResult<OfflineStatus> {
-    state.offline.remove_all(&book_id).await?;
-    state.offline.status(&book_id).await
+) -> Result<OfflineStatus, crate::ipc::IpcError> {
+    let manager = Arc::clone(&state.offline);
+    let result: IpcResult<_> = state
+        .offline
+        .run_mutation(async move {
+            manager.remove_all(&book_id).await?;
+            manager.status(&book_id).await
+        })
+        .await;
+    result.map_err(Into::into)
 }
 impl OfflineManager {
     async fn pause(&self, book_id: &str) {
         let mut jobs = self.jobs.lock().await;
         let job = jobs.entry(book_id.to_owned()).or_insert_with(|| Job {
-            state: "paused",
+            state: OfflineJobState::Paused,
             error: None,
             generation: 0,
             engine: String::new(),
+            budget: None,
         });
         self.queue.stop_offline(book_id, job.generation);
-        job.state = "paused";
+        job.state = OfflineJobState::Paused;
         job.generation = job.generation.wrapping_add(1);
         drop(jobs);
-        self.wake.notify_waiters();
+        self.emit_status(book_id).await;
     }
     pub(crate) async fn set_billing_unit(
         &self,
@@ -1696,7 +2304,7 @@ impl OfflineManager {
             .filter(|(_, job)| job.engine == "openrouter")
         {
             self.queue.stop_offline(book_id, job.generation);
-            job.state = "paused";
+            job.state = OfflineJobState::Paused;
             job.generation = job.generation.wrapping_add(1);
         }
         self.quotes.lock().await.clear();
@@ -1709,19 +2317,17 @@ impl OfflineManager {
     }
     pub(crate) async fn remove_all(&self, book_id: &str) -> IpcResult<()> {
         let _plan_lifecycle = self.plan_gate.lock().await;
-        {
-            let _store = self.store.lock().map_err(|e| e.to_string())?;
-            self.invalidate_plans();
-        }
+        self.invalidate_under_store().await?;
         let mut jobs = self.jobs.lock().await;
         let job = jobs.entry(book_id.to_owned()).or_insert_with(|| Job {
-            state: "paused",
+            state: OfflineJobState::Paused,
             error: None,
             generation: 0,
             engine: String::new(),
+            budget: None,
         });
         self.queue.stop_offline(book_id, job.generation);
-        job.state = "paused";
+        job.state = OfflineJobState::Paused;
         job.generation = job.generation.wrapping_add(1);
         let manifests = self.manifests().await?;
         let id = book_id.to_owned();
@@ -1744,10 +2350,7 @@ impl OfflineManager {
             .lock()
             .await
             .retain(|_, quote| quote.manifest.book_id != book_id);
-        {
-            let _store = self.store.lock().map_err(|e| e.to_string())?;
-            self.invalidate_plans();
-        }
+        self.invalidate_under_store().await?;
         outcome
     }
 }
@@ -1761,6 +2364,70 @@ mod tests {
         collections::BTreeMap,
         sync::atomic::{AtomicUsize, Ordering},
     };
+
+    #[tokio::test]
+    async fn cancelled_mutation_keeps_gate_and_permit_until_blocking_work_finishes() -> IpcResult<()>
+    {
+        let (manager, root) = manager()?;
+        let gate = Arc::clone(&manager.plan_gate);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let outer = Arc::clone(&manager);
+        let runner = tokio::spawn(async move {
+            outer
+                .run_mutation(async move {
+                    let guard = gate.lock_owned().await;
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let _guard = guard;
+                        let _ = started_tx.send(());
+                        release_rx.recv().map_err(|e| e.to_string())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                })
+                .await
+        });
+        started_rx.await.map_err(|e| e.to_string())?;
+        runner.abort();
+        manager.begin_shutdown();
+        assert!(manager.mutation_permit().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), manager.plan_gate.lock())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), manager.drain_mutations())
+                .await
+                .is_err()
+        );
+        release_tx.send(()).map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(2), manager.drain_mutations())
+            .await
+            .map_err(|e| e.to_string())?;
+        cleanup(manager, root).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_accepts_final_save_until_frontend_flush_and_waits_for_it() -> IpcResult<()> {
+        let (manager, root) = manager()?;
+        manager.begin_shutdown();
+        assert!(manager.mutation_permit().is_err());
+        let save = manager.final_save_permit()?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), manager.drain_mutations())
+                .await
+                .is_err()
+        );
+        assert!(manager.final_save_permit().is_err());
+        drop(save);
+        tokio::time::timeout(Duration::from_secs(2), manager.drain_mutations())
+            .await
+            .map_err(|e| e.to_string())?;
+        cleanup(manager, root).await?;
+        Ok(())
+    }
 
     fn manager() -> IpcResult<(Arc<OfflineManager>, std::path::PathBuf)> {
         let root = std::env::temp_dir().join(format!("readio-offline-test-{}", Uuid::new_v4()));
@@ -1825,6 +2492,7 @@ mod tests {
                     data: "YQ==".into(),
                     mime: "audio/mpeg".into(),
                     playback_rate: 1.0,
+                    timings: Vec::new(),
                 }))
             })
             .await?;
@@ -1843,6 +2511,7 @@ mod tests {
             model_voice: None,
             dictionary: BTreeMap::default(),
             max_escaped_bytes: None,
+            synthesis: None,
         };
         let block = AudioBlock {
             id: "a".repeat(64),
@@ -1884,6 +2553,7 @@ mod tests {
             model_voice: None,
             dictionary: BTreeMap::new(),
             max_escaped_bytes: None,
+            synthesis: None,
         };
         let price = Price {
             prompt: "0.000015".into(),
@@ -1958,6 +2628,7 @@ mod tests {
             model_voice: None,
             dictionary: BTreeMap::new(),
             max_escaped_bytes: None,
+            synthesis: None,
         };
         let mut quote = Quote {
             plan: Arc::new(
@@ -2034,7 +2705,7 @@ mod tests {
         manager.pause(&id).await;
         assert!(
             manager
-                .start(id.clone(), first.quote_id, false)
+                .start(id.clone(), first.quote_id, false, OfflineBudget::default())
                 .await
                 .is_err()
         );
@@ -2043,7 +2714,7 @@ mod tests {
         manager.remove_all(&id).await?;
         assert!(
             manager
-                .start(id.clone(), second.quote_id, false)
+                .start(id.clone(), second.quote_id, false, OfflineBudget::default())
                 .await
                 .is_err()
         );
@@ -2068,7 +2739,12 @@ mod tests {
         manager
             .set_billing_unit("any/model".into(), Some(BillingUnit::Utf8Byte))
             .await?;
-        assert!(manager.start(id, quote.quote_id, false).await.is_err());
+        assert!(
+            manager
+                .start(id, quote.quote_id, false, OfflineBudget::default())
+                .await
+                .is_err()
+        );
         assert_eq!(
             manager
                 .store
@@ -2093,6 +2769,7 @@ mod tests {
             model_voice: None,
             dictionary: BTreeMap::default(),
             max_escaped_bytes: None,
+            synthesis: None,
         };
         let block = AudioBlock {
             id: "b".repeat(64),
@@ -2133,6 +2810,14 @@ mod pipeline_tests;
 #[cfg(test)]
 #[path = "offline_edition_tests.rs"]
 mod edition_tests;
+
+#[cfg(test)]
+#[path = "offline_budget_tests.rs"]
+mod budget_tests;
+
+#[cfg(test)]
+#[path = "offline_memory_tests.rs"]
+mod memory_tests;
 
 #[path = "offline_plans.rs"]
 mod plans;

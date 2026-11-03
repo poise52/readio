@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    io::{self, Write},
     mem::size_of,
     sync::OnceLock,
 };
@@ -10,6 +11,44 @@ use std::{
 pub const EDITION_PLAN_VERSION: u32 = 1;
 /// Application safety limit, independent of provider request limits.
 pub const MAX_EDITION_PLAN_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct BoundedPlanWriter {
+    data: Vec<u8>,
+    exceeded: bool,
+}
+
+impl Write for BoundedPlanWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self
+            .data
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|size| size > MAX_EDITION_PLAN_BYTES)
+        {
+            self.exceeded = true;
+            return Err(io::Error::other("plan too large"));
+        }
+        let needed = self.data.len() + bytes.len();
+        if needed > self.data.capacity() {
+            let capacity = self
+                .data
+                .capacity()
+                .saturating_mul(2)
+                .max(needed)
+                .min(MAX_EDITION_PLAN_BYTES);
+            self.data
+                .try_reserve_exact(capacity - self.data.len())
+                .map_err(|_| io::Error::other("plan allocation failed"))?;
+        }
+        self.data.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,15 +70,6 @@ pub struct EditionPlan {
     block_index: OnceLock<Vec<HashMap<String, usize>>>,
 }
 
-fn hash_parts(parts: &[&[u8]]) -> String {
-    let mut digest = Sha256::new();
-    for part in parts {
-        digest.update((part.len() as u64).to_be_bytes());
-        digest.update(part);
-    }
-    format!("{:x}", digest.finalize())
-}
-
 fn source_fingerprint(book: &Book) -> String {
     let mut hash = Sha256::new();
     let add = |hash: &mut Sha256, bytes: &[u8]| {
@@ -55,14 +85,7 @@ fn source_fingerprint(book: &Book) -> String {
 }
 
 fn block_id(block: &AudioBlock, profile: &AudioProfile) -> String {
-    hash_parts(&[
-        b"readio-audio-block-v1",
-        profile.engine.as_bytes(),
-        profile.voice.as_bytes(),
-        profile.model.as_deref().unwrap_or("").as_bytes(),
-        profile.model_voice.as_deref().unwrap_or("").as_bytes(),
-        block.text.as_bytes(),
-    ])
+    crate::audio::canonical_block_id(&block.text, profile)
 }
 
 fn invalid() -> Error {
@@ -75,40 +98,46 @@ impl EditionPlan {
     /// # Errors
     /// Returns an error when the generated plan is invalid or exceeds the application limit.
     pub fn build(book: &Book, profile: &AudioProfile) -> Result<Self> {
-        let planner = ChapterPlanner::new(profile);
-        Self::with_planner(book, profile, |book, index, _| {
-            planner.plan_chapter(index, &book.chapters[index])
+        let planner = ChapterPlanner::try_new(profile)?;
+        Self::with_planner(book, profile, |book, index, _, budget| {
+            planner.try_plan_chapter_budgeted(index, &book.chapters[index], budget)
         })
     }
 
     fn with_planner(
         book: &Book,
         profile: &AudioProfile,
-        planner: impl Fn(&Book, usize, &AudioProfile) -> Vec<AudioBlock>,
+        planner: impl Fn(
+            &Book,
+            usize,
+            &AudioProfile,
+            &mut crate::audio::PlanningBudget,
+        ) -> Result<Vec<AudioBlock>>,
     ) -> Result<Self> {
+        let mut budget = crate::audio::PlanningBudget::default();
+        let mut chapters = Vec::new();
+        for (index, chapter) in book.chapters.iter().enumerate() {
+            budget.chapter(&chapter.title)?;
+            chapters.push(EditionChapter {
+                title: chapter.title.clone(),
+                source_utf16_len: chapter.text.encode_utf16().count(),
+                blocks: planner(book, index, profile, &mut budget)?,
+            });
+        }
         let plan = Self {
             version: EDITION_PLAN_VERSION,
             book_id: book.id.clone(),
             profile_id: profile.id(),
             source_fingerprint: source_fingerprint(book),
             block_index: OnceLock::new(),
-            chapters: book
-                .chapters
-                .iter()
-                .enumerate()
-                .map(|(index, chapter)| EditionChapter {
-                    title: chapter.title.clone(),
-                    source_utf16_len: chapter.text.encode_utf16().count(),
-                    blocks: planner(book, index, profile),
-                })
-                .collect(),
+            chapters,
         };
         plan.validate(book, profile)?;
         plan.encode()?;
         Ok(plan)
     }
 
-    /// Migrates a legacy manifest only if the frozen legacy planner reproduces every saved ID.
+    /// Migrates a legacy manifest only if the frozen v1 planner reproduces every saved ID.
     ///
     /// # Errors
     /// Returns an error if any ID differs, or the plan is invalid or too large.
@@ -116,9 +145,12 @@ impl EditionPlan {
         book: &Book,
         profile: &AudioProfile,
         saved_ids: &[String],
-        frozen_planner: impl Fn(&Book, usize, &AudioProfile) -> Vec<AudioBlock>,
     ) -> Result<Self> {
-        let plan = Self::with_planner(book, profile, frozen_planner)?;
+        let bounded = ChapterPlanner::try_new(profile)?;
+        let plan = Self::with_planner(book, profile, |book, chapter, _, budget| {
+            bounded.validate_legacy_source(&book.chapters[chapter].text)?;
+            bounded.try_plan_v1_chapter_budgeted(chapter, &book.chapters[chapter], budget)
+        })?;
         if !plan.block_ids().iter().eq(saved_ids.iter()) {
             return Err(Error::Format(
                 "План старого издания не совпадает с сохранёнными аудиоблоками".into(),
@@ -177,6 +209,13 @@ impl EditionPlan {
                 }
                 let mut previous_part_start = block.start;
                 let mut previous_part_index = 0;
+                let mut previous_synthesis_end = 0;
+                let mut synthesis_boundaries = HashSet::from([0]);
+                let mut synthesis_offset = 0;
+                for ch in block.text.chars() {
+                    synthesis_offset += ch.len_utf16();
+                    synthesis_boundaries.insert(synthesis_offset);
+                }
                 for part in &block.passages {
                     let passage_index_invalid = part.index >= saved.source_utf16_len;
                     if part.start < block.start
@@ -188,6 +227,18 @@ impl EditionPlan {
                         || part.index < previous_part_index
                     {
                         return Err(invalid());
+                    }
+                    match (part.synthesis_start, part.synthesis_end) {
+                        (None, None) => (),
+                        (Some(start), Some(end))
+                            if start >= previous_synthesis_end
+                                && start < end
+                                && synthesis_boundaries.contains(&start)
+                                && synthesis_boundaries.contains(&end) =>
+                        {
+                            previous_synthesis_end = end;
+                        }
+                        _ => return Err(invalid()),
                     }
                     previous_part_start = part.start;
                     previous_part_index = part.index;
@@ -284,12 +335,16 @@ impl EditionPlan {
     /// # Errors
     /// Returns an error if serialization fails or exceeds the application safety limit.
     pub fn encode(&self) -> Result<(Vec<u8>, String)> {
-        let bytes = serde_json::to_vec(self)?;
-        if bytes.len() > MAX_EDITION_PLAN_BYTES {
-            return Err(Error::Format(
-                "План издания превышает допустимый размер приложения".into(),
-            ));
+        let mut writer = BoundedPlanWriter::default();
+        if let Err(error) = serde_json::to_writer(&mut writer, self) {
+            if writer.exceeded {
+                return Err(Error::Format(
+                    "План издания превышает допустимый размер приложения".into(),
+                ));
+            }
+            return Err(error.into());
         }
+        let bytes = writer.data;
         let digest = format!("{:x}", Sha256::digest(&bytes));
         Ok((bytes, digest))
     }
@@ -379,12 +434,72 @@ mod tests {
         let (book, profile) = fixture();
         let original = EditionPlan::build(&book, &profile).unwrap();
         let ids = original.block_ids();
-        let migrated = EditionPlan::migrate_legacy(&book, &profile, &ids, plan_chapter).unwrap();
+        let migrated = EditionPlan::migrate_legacy(&book, &profile, &ids).unwrap();
         assert_eq!(migrated.block_ids(), ids);
-        let mut different = ids.clone();
+        let mut different = ids;
         different.pop();
-        assert!(EditionPlan::migrate_legacy(&book, &profile, &different, plan_chapter).is_err());
-        assert!(EditionPlan::migrate_legacy(&book, &profile, &ids, |_, _, _| Vec::new()).is_err());
+        assert!(EditionPlan::migrate_legacy(&book, &profile, &different).is_err());
+    }
+
+    #[test]
+    fn planning_budget_is_shared_across_chapters() {
+        let mut profile = AudioProfile::from_preferences(&Preferences::default());
+        profile.synthesis = Some(crate::SynthesisSettings {
+            input_limit: Some(crate::InputLimit {
+                unit: crate::InputUnit::Character,
+                value: 1,
+                source: crate::LimitSource::User,
+                verified_at: None,
+            }),
+            ..crate::SynthesisSettings::default()
+        });
+        let chapter = "x".repeat(4_100);
+        let book = Book {
+            id: "budget".into(),
+            chapters: vec![
+                Chapter {
+                    title: "a".into(),
+                    text: chapter.clone(),
+                },
+                Chapter {
+                    title: "b".into(),
+                    text: chapter,
+                },
+            ],
+            ..Book::default()
+        };
+        let planner = ChapterPlanner::try_new(&profile).unwrap();
+        assert!(planner.try_plan_chapter(0, &book.chapters[0]).is_ok());
+        assert!(planner.try_plan_chapter(1, &book.chapters[1]).is_ok());
+        assert!(EditionPlan::build(&book, &profile).is_err());
+    }
+
+    #[test]
+    fn empty_chapters_are_charged_before_plan_allocation() {
+        let profile = AudioProfile::from_preferences(&Preferences::default());
+        let book = Book {
+            id: "many-chapters".into(),
+            chapters: (0..4_097)
+                .map(|_| Chapter {
+                    title: String::new(),
+                    text: String::new(),
+                })
+                .collect(),
+            ..Book::default()
+        };
+        assert!(EditionPlan::build(&book, &profile).is_err());
+    }
+
+    #[test]
+    fn bounded_writer_rejects_growth_before_exceeding_limit() {
+        let mut writer = BoundedPlanWriter::default();
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..MAX_EDITION_PLAN_BYTES / chunk.len() {
+            writer.write_all(&chunk).unwrap();
+        }
+        assert!(writer.write_all(b"x").is_err());
+        assert_eq!(writer.data.len(), MAX_EDITION_PLAN_BYTES);
+        assert!(writer.exceeded);
     }
 
     #[test]

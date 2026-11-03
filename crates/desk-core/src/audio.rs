@@ -1,4 +1,4 @@
-use crate::{Book, Chapter, Error, Preferences, Result, split_passages};
+use crate::{Book, Chapter, Error, Preferences, Result};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,8 +15,57 @@ pub const AUDIO_BLOCK_MAX_ESCAPED_BYTES: usize = 3_000;
 pub const AUDIO_BLOCK_MAX_PASSAGES: usize = 6;
 const TRANSIENT_LIMIT: u64 = 1024 * 1024 * 1024;
 const MAX_AUDIO: usize = 32 * 1024 * 1024;
+const MAX_AUDIO_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_AUDIO_TIMINGS: usize = 4096;
 /// Application safety limit for a lightweight offline manifest.
 pub const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioFormat {
+    Mp3,
+    Pcm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTransport {
+    pub format: AudioFormat,
+    pub pcm_sample_rate: Option<u32>,
+    pub pcm_channels: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputUnit {
+    Character,
+    Utf8Byte,
+    XmlEscapedByte,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitSource {
+    User,
+    Provider,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InputLimit {
+    pub unit: InputUnit,
+    pub value: usize,
+    pub source: LimitSource,
+    pub verified_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SynthesisSettings {
+    pub resource_revision: Option<String>,
+    pub transport: Option<AudioTransport>,
+    pub input_limit: Option<InputLimit>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +77,8 @@ pub struct AudioProfile {
     pub dictionary: BTreeMap<String, String>,
     #[serde(default)]
     pub max_escaped_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis: Option<SynthesisSettings>,
 }
 
 impl AudioProfile {
@@ -65,6 +116,9 @@ impl AudioProfile {
         } else {
             (None, None)
         };
+        let synthesis = model
+            .as_ref()
+            .and_then(|id| prefs.open_router_model_settings.get(id).cloned());
         Self {
             engine,
             voice,
@@ -72,6 +126,7 @@ impl AudioProfile {
             model_voice,
             dictionary: prefs.dictionary.clone(),
             max_escaped_bytes: None,
+            synthesis,
         }
     }
 
@@ -89,6 +144,32 @@ pub struct AudioPart {
     pub start: usize,
     pub end: usize,
     pub weight: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_start: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_end: Option<usize>,
+}
+
+fn prepared_part(
+    index: usize,
+    start: usize,
+    end: usize,
+    current: &str,
+    texts: &[String],
+) -> AudioPart {
+    let synthesis_start = texts
+        .iter()
+        .map(|text| text.encode_utf16().count())
+        .sum::<usize>()
+        + texts.len() * 2;
+    AudioPart {
+        index,
+        start,
+        end,
+        weight: weight(current),
+        synthesis_start: Some(synthesis_start),
+        synthesis_end: Some(synthesis_start + current.encode_utf16().count()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +264,129 @@ fn prepare_units(text: &str, offset: usize, rules: &[(Regex, String)]) -> Vec<Un
     units
 }
 
+const MAX_DICTIONARY_ENTRIES: usize = 128;
+const MAX_PREPARED_UNITS: usize = 250_000;
+const MAX_PLANNING_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Validates the bounded pronunciation dictionary before storing or compiling it.
+///
+/// # Errors
+/// Returns an error for oversized or malformed entries.
+pub fn validate_dictionary(dictionary: &BTreeMap<String, String>) -> Result<()> {
+    if dictionary.len() > MAX_DICTIONARY_ENTRIES {
+        return Err(Error::Format(
+            "Слишком много записей словаря произношения".into(),
+        ));
+    }
+    for (key, replacement) in dictionary {
+        if key.trim().is_empty()
+            || key.len() > 128
+            || replacement.len() > 1024
+            || key.chars().any(char::is_control)
+            || replacement.chars().any(char::is_control)
+        {
+            return Err(Error::Format(
+                "Некорректная запись словаря произношения".into(),
+            ));
+        }
+        RegexBuilder::new(&regex::escape(key.trim()))
+            .case_insensitive(true)
+            .build()
+            .map_err(|_| Error::Format("Не удалось обработать слово словаря".into()))?;
+    }
+    Ok(())
+}
+
+fn unicode_word_char(ch: char) -> bool {
+    static WORD: std::sync::OnceLock<Option<Regex>> = std::sync::OnceLock::new();
+    if ch.is_alphanumeric() || ch == '_' {
+        return true;
+    }
+    if ch.is_whitespace() || ch.is_ascii() {
+        return false;
+    }
+    WORD.get_or_init(|| Regex::new(r"^\w$").ok())
+        .as_ref()
+        .is_some_and(|pattern| pattern.is_match(ch.encode_utf8(&mut [0; 4])))
+}
+
+fn prepare_units_checked(
+    text: &str,
+    offset: usize,
+    rules: &[(Regex, String)],
+    legacy: bool,
+) -> Result<Vec<Unit>> {
+    if text.chars().count() > MAX_PREPARED_UNITS {
+        return Err(Error::Format(
+            "Фрагмент текста слишком велик для подготовки озвучивания".into(),
+        ));
+    }
+    let mut position = offset;
+    let mut units: Vec<Unit> = text
+        .chars()
+        .map(|ch| {
+            let start = position;
+            position += ch.len_utf16();
+            Unit {
+                ch,
+                start,
+                end: position,
+            }
+        })
+        .collect();
+    for (pattern, replacement) in rules {
+        let current: String = units.iter().map(|unit| unit.ch).collect();
+        let mut boundaries = BTreeMap::new();
+        for (index, (byte, _)) in current.char_indices().enumerate() {
+            boundaries.insert(byte, index);
+        }
+        boundaries.insert(current.len(), units.len());
+        let mut next = Vec::new();
+        let mut cursor = 0;
+        for matched in pattern.find_iter(&current) {
+            let (Some(&start), Some(&end)) = (
+                boundaries.get(&matched.start()),
+                boundaries.get(&matched.end()),
+            ) else {
+                continue;
+            };
+            let is_word = if legacy { word_char } else { unicode_word_char };
+            if start > 0 && is_word(units[start - 1].ch)
+                || end < units.len() && is_word(units[end].ch)
+            {
+                continue;
+            }
+            let count = replacement.chars().count();
+            if next
+                .len()
+                .saturating_add(start - cursor)
+                .saturating_add(count)
+                > MAX_PREPARED_UNITS
+            {
+                return Err(Error::Format(
+                    "Замены словаря слишком сильно увеличивают текст".into(),
+                ));
+            }
+            next.extend_from_slice(&units[cursor..start]);
+            let (source_start, source_end) = (units[start].start, units[end - 1].end);
+            next.extend(replacement.chars().map(|ch| Unit {
+                ch,
+                start: source_start,
+                end: source_end,
+            }));
+            cursor = end;
+        }
+        if next.len().saturating_add(units.len() - cursor) > MAX_PREPARED_UNITS {
+            return Err(Error::Format(
+                "Замены словаря слишком сильно увеличивают текст".into(),
+            ));
+        }
+        next.extend_from_slice(&units[cursor..]);
+        units = next;
+    }
+    Ok(units)
+}
+
 fn hash_parts(parts: &[&[u8]]) -> String {
     let mut hash = Sha256::new();
     for part in parts {
@@ -192,12 +396,39 @@ fn hash_parts(parts: &[&[u8]]) -> String {
     format!("{:x}", hash.finalize())
 }
 
+pub fn canonical_block_id(text: &str, profile: &AudioProfile) -> String {
+    if let Some(settings) = &profile.synthesis
+        && (settings.resource_revision.is_some() || settings.transport.is_some())
+    {
+        let identity = serde_json::to_vec(&(&settings.resource_revision, &settings.transport))
+            .unwrap_or_default();
+        return hash_parts(&[
+            b"readio-audio-block-v2",
+            profile.engine.as_bytes(),
+            profile.voice.as_bytes(),
+            profile.model.as_deref().unwrap_or("").as_bytes(),
+            profile.model_voice.as_deref().unwrap_or("").as_bytes(),
+            &identity,
+            text.as_bytes(),
+        ]);
+    }
+    hash_parts(&[
+        b"readio-audio-block-v1",
+        profile.engine.as_bytes(),
+        profile.voice.as_bytes(),
+        profile.model.as_deref().unwrap_or("").as_bytes(),
+        profile.model_voice.as_deref().unwrap_or("").as_bytes(),
+        text.as_bytes(),
+    ])
+}
+
 fn finish_block(
     result: &mut Vec<AudioBlock>,
     chapter: usize,
     profile: &AudioProfile,
     parts: &mut Vec<AudioPart>,
     texts: &mut Vec<String>,
+    legacy: bool,
 ) {
     if parts.is_empty() {
         return;
@@ -209,14 +440,18 @@ fn finish_block(
     let Some(last) = parts.last() else {
         return;
     };
-    let id = hash_parts(&[
-        b"readio-audio-block-v1",
-        profile.engine.as_bytes(),
-        profile.voice.as_bytes(),
-        profile.model.as_deref().unwrap_or("").as_bytes(),
-        profile.model_voice.as_deref().unwrap_or("").as_bytes(),
-        text.as_bytes(),
-    ]);
+    let id = if legacy {
+        hash_parts(&[
+            b"readio-audio-block-v1",
+            profile.engine.as_bytes(),
+            profile.voice.as_bytes(),
+            profile.model.as_deref().unwrap_or("").as_bytes(),
+            profile.model_voice.as_deref().unwrap_or("").as_bytes(),
+            text.as_bytes(),
+        ])
+    } else {
+        canonical_block_id(&text, profile)
+    };
     result.push(AudioBlock {
         id,
         chapter,
@@ -229,6 +464,102 @@ fn finish_block(
     texts.clear();
 }
 
+const MAX_PLANNED_BLOCKS: usize = 8_192;
+const MAX_PLANNED_PARTS: usize = 32_768;
+const MAX_PLAN_OWNED_BYTES: usize = 24 * 1024 * 1024;
+const MAX_PLAN_CHAPTERS: usize = 4_096;
+
+#[derive(Default)]
+pub struct PlanningBudget {
+    blocks: usize,
+    parts: usize,
+    owned_bytes: usize,
+    chapters: usize,
+}
+
+impl PlanningBudget {
+    pub(crate) fn chapter(&mut self, title: &str) -> Result<()> {
+        self.chapters = self.chapters.checked_add(1).ok_or_else(plan_limit)?;
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_add(256)
+            .and_then(|n| n.checked_add(title.len().saturating_mul(2)))
+            .ok_or_else(plan_limit)?;
+        self.check()
+    }
+    fn block(&mut self, parts: usize, text_bytes: usize) -> Result<()> {
+        self.blocks = self.blocks.checked_add(1).ok_or_else(plan_limit)?;
+        self.parts = self.parts.checked_add(parts).ok_or_else(plan_limit)?;
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_add(512)
+            .and_then(|n| n.checked_add(parts.saturating_mul(128)))
+            .and_then(|n| n.checked_add(text_bytes.saturating_mul(2)))
+            .ok_or_else(plan_limit)?;
+        self.check()
+    }
+    fn check(&self) -> Result<()> {
+        if self.blocks > MAX_PLANNED_BLOCKS
+            || self.parts > MAX_PLANNED_PARTS
+            || self.owned_bytes > MAX_PLAN_OWNED_BYTES
+            || self.chapters > MAX_PLAN_CHAPTERS
+        {
+            Err(plan_limit())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn plan_limit() -> Error {
+    Error::Format("План озвучивания превышает лимит памяти приложения".into())
+}
+
+fn finish_checked(
+    result: &mut Vec<AudioBlock>,
+    chapter: usize,
+    profile: &AudioProfile,
+    parts: &mut Vec<AudioPart>,
+    texts: &mut Vec<String>,
+    budget: &mut PlanningBudget,
+) -> Result<()> {
+    if parts.is_empty() {
+        return Ok(());
+    }
+    let text_bytes = texts
+        .iter()
+        .try_fold(0_usize, |sum, text| sum.checked_add(text.len()))
+        .and_then(|sum| sum.checked_add(texts.len().saturating_sub(1).saturating_mul(2)))
+        .ok_or_else(plan_limit)?;
+    budget.block(parts.len(), text_bytes)?;
+    finish_block(result, chapter, profile, parts, texts, false);
+    Ok(())
+}
+
+fn finish_optional_budget(
+    result: &mut Vec<AudioBlock>,
+    chapter: usize,
+    profile: &AudioProfile,
+    parts: &mut Vec<AudioPart>,
+    texts: &mut Vec<String>,
+    legacy: bool,
+    budget: &mut Option<&mut PlanningBudget>,
+) -> Result<()> {
+    if parts.is_empty() {
+        return Ok(());
+    }
+    if let Some(budget) = budget {
+        let text_bytes = texts
+            .iter()
+            .try_fold(0_usize, |sum, text| sum.checked_add(text.len()))
+            .and_then(|sum| sum.checked_add(texts.len().saturating_sub(1).saturating_mul(2)))
+            .ok_or_else(plan_limit)?;
+        budget.block(parts.len(), text_bytes)?;
+    }
+    finish_block(result, chapter, profile, parts, texts, legacy);
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ChapterPlanner {
     profile: AudioProfile,
@@ -236,6 +567,22 @@ pub struct ChapterPlanner {
 }
 
 impl ChapterPlanner {
+    /// Compiles bounded pronunciation rules and validates model constraints.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid dictionary or provider limit.
+    pub fn try_new(profile: &AudioProfile) -> Result<Self> {
+        validate_dictionary(&profile.dictionary)?;
+        if profile
+            .synthesis
+            .as_ref()
+            .and_then(|settings| settings.input_limit.as_ref())
+            .is_some_and(|limit| limit.value == 0)
+        {
+            return Err(Error::Format("Лимит модели должен быть больше нуля".into()));
+        }
+        Ok(Self::new(profile))
+    }
     #[must_use]
     pub fn new(profile: &AudioProfile) -> Self {
         let rules = profile
@@ -264,6 +611,248 @@ impl ChapterPlanner {
         self.plan_text(chapter, &source.text)
     }
 
+    /// Plans a chapter with bounded expansion and explicit input-limit checks.
+    ///
+    /// # Errors
+    /// Returns an error when source or expanded text exceeds application limits.
+    pub fn try_plan_chapter(&self, chapter: usize, source: &Chapter) -> Result<Vec<AudioBlock>> {
+        self.try_plan_text(chapter, &source.text)
+    }
+
+    pub(crate) fn try_plan_chapter_budgeted(
+        &self,
+        chapter: usize,
+        source: &Chapter,
+        budget: &mut PlanningBudget,
+    ) -> Result<Vec<AudioBlock>> {
+        self.try_plan_text_budgeted(chapter, &source.text, budget)
+    }
+
+    pub(crate) fn try_plan_v1_chapter_budgeted(
+        &self,
+        chapter: usize,
+        source: &Chapter,
+        budget: &mut PlanningBudget,
+    ) -> Result<Vec<AudioBlock>> {
+        self.plan_impl_budgeted(chapter, &source.text, true, Some(budget))
+    }
+
+    /// Bounds legacy pronunciation expansion before invoking the frozen v1 planner.
+    ///
+    /// # Errors
+    /// Returns an error when a chapter or dictionary expansion exceeds the application budget.
+    pub fn validate_legacy_source(&self, text: &str) -> Result<()> {
+        if text.len() > MAX_PLANNING_SOURCE_BYTES {
+            return Err(Error::Format(
+                "Глава превышает допустимый размер планирования".into(),
+            ));
+        }
+        if self.rules.is_empty() {
+            return Ok(());
+        }
+        for passage in crate::model::passage_iter(text) {
+            prepare_units_checked(&passage.text, passage.start, &self.rules, true)?;
+        }
+        Ok(())
+    }
+
+    /// Plans prepared text without exceeding configured provider or application limits.
+    ///
+    /// # Errors
+    /// Returns an error when source, dictionary expansion, or one replacement cannot fit.
+    #[allow(clippy::too_many_lines)] // Keep sizing and source mapping in one bounded pass.
+    pub fn try_plan_text(&self, chapter: usize, text: &str) -> Result<Vec<AudioBlock>> {
+        self.try_plan_text_budgeted(chapter, text, &mut PlanningBudget::default())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn try_plan_text_budgeted(
+        &self,
+        chapter: usize,
+        text: &str,
+        budget: &mut PlanningBudget,
+    ) -> Result<Vec<AudioBlock>> {
+        if text.len() > MAX_PLANNING_SOURCE_BYTES {
+            return Err(Error::Format(
+                "Глава превышает допустимый размер планирования".into(),
+            ));
+        }
+        let provider = self
+            .profile
+            .synthesis
+            .as_ref()
+            .and_then(|settings| settings.input_limit.as_ref());
+        let mut blocks = Vec::new();
+        let mut parts = Vec::new();
+        let mut texts = Vec::new();
+        let mut app_size = 0_usize;
+        let mut provider_size = 0_usize;
+        for (index, passage) in crate::model::passage_iter(text).enumerate() {
+            let mut current = String::new();
+            let mut start = 0;
+            let mut end = 0;
+            let mut previous_span = None;
+            let mut remaining = passage.text.as_str();
+            let mut source_offset = passage.start;
+            while !remaining.is_empty() {
+                let chunk_units = if self.rules.is_empty() {
+                    MAX_PREPARED_UNITS
+                } else {
+                    MAX_PREPARED_UNITS / 8
+                };
+                let mut end_byte = remaining
+                    .char_indices()
+                    .nth(chunk_units)
+                    .map_or(remaining.len(), |(byte, _)| byte);
+                if end_byte < remaining.len() && !self.rules.is_empty() {
+                    if self
+                        .profile
+                        .dictionary
+                        .keys()
+                        .any(|key| key.chars().any(char::is_whitespace))
+                    {
+                        return Err(Error::Format(
+                            "Слишком длинный фрагмент для словаря с составными словами".into(),
+                        ));
+                    }
+                    end_byte = remaining[..end_byte]
+                        .char_indices()
+                        .rev()
+                        .find(|(_, ch)| ch.is_whitespace())
+                        .map(|(byte, ch)| byte + ch.len_utf8())
+                        .ok_or_else(|| {
+                            Error::Format("Слишком длинное слово для обработки словаря".into())
+                        })?;
+                }
+                let chunk = &remaining[..end_byte];
+                let units = prepare_units_checked(chunk, source_offset, &self.rules, false)?;
+                for (at, unit) in units.iter().enumerate() {
+                    if unicode_word_char(unit.ch)
+                        && (at == 0 || !unicode_word_char(units[at - 1].ch))
+                        && app_size > 0
+                    {
+                        let word = units[at..]
+                            .iter()
+                            .take_while(|item| unicode_word_char(item.ch));
+                        let (word_app, word_provider) =
+                            word.fold((0_usize, 0_usize), |(app, model), item| {
+                                let escaped = escaped_size(item.ch);
+                                let size = provider.map_or(0, |limit| match limit.unit {
+                                    InputUnit::Character => 1,
+                                    InputUnit::Utf8Byte => item.ch.len_utf8(),
+                                    InputUnit::XmlEscapedByte => escaped,
+                                });
+                                (app.saturating_add(escaped), model.saturating_add(size))
+                            });
+                        let separator = usize::from(current.is_empty() && !parts.is_empty()) * 2;
+                        let fits_empty = word_app <= self.profile.escaped_byte_limit()
+                            && provider.is_none_or(|limit| word_provider <= limit.value);
+                        let exceeds = app_size.saturating_add(separator).saturating_add(word_app)
+                            > self.profile.escaped_byte_limit()
+                            || provider.is_some_and(|limit| {
+                                provider_size
+                                    .saturating_add(separator)
+                                    .saturating_add(word_provider)
+                                    > limit.value
+                            });
+                        if fits_empty && exceeds {
+                            if previous_span == Some((unit.start, unit.end)) {
+                                return Err(Error::Format(
+                                    "Замена словаря не помещается в один аудиоблок".into(),
+                                ));
+                            }
+                            if !current.is_empty() {
+                                parts.push(prepared_part(index, start, end, &current, &texts));
+                                texts.push(std::mem::take(&mut current));
+                            }
+                            finish_checked(
+                                &mut blocks,
+                                chapter,
+                                &self.profile,
+                                &mut parts,
+                                &mut texts,
+                                budget,
+                            )?;
+                            app_size = 0;
+                            provider_size = 0;
+                        }
+                    }
+                    let separator = usize::from(current.is_empty() && !parts.is_empty()) * 2;
+                    let size = escaped_size(unit.ch);
+                    let provider_char = provider.map_or(0, |limit| match limit.unit {
+                        InputUnit::Character => 1,
+                        InputUnit::Utf8Byte => unit.ch.len_utf8(),
+                        InputUnit::XmlEscapedByte => size,
+                    });
+                    if provider.is_some_and(|limit| provider_char > limit.value) {
+                        return Err(Error::Format(
+                            "Символ не помещается в заданный лимит модели".into(),
+                        ));
+                    }
+                    let over_provider = provider.is_some_and(|limit| {
+                        provider_size
+                            .saturating_add(separator)
+                            .saturating_add(provider_char)
+                            > limit.value
+                    });
+                    if app_size.saturating_add(separator).saturating_add(size)
+                        > self.profile.escaped_byte_limit()
+                        || over_provider
+                        || current.is_empty() && parts.len() >= AUDIO_BLOCK_MAX_PASSAGES
+                    {
+                        if previous_span == Some((unit.start, unit.end)) {
+                            return Err(Error::Format(
+                                "Замена словаря не помещается в один аудиоблок".into(),
+                            ));
+                        }
+                        if !current.is_empty() {
+                            parts.push(prepared_part(index, start, end, &current, &texts));
+                            texts.push(std::mem::take(&mut current));
+                        }
+                        finish_checked(
+                            &mut blocks,
+                            chapter,
+                            &self.profile,
+                            &mut parts,
+                            &mut texts,
+                            budget,
+                        )?;
+                        app_size = 0;
+                        provider_size = 0;
+                    }
+                    if current.is_empty() {
+                        if !parts.is_empty() {
+                            app_size += 2;
+                            provider_size += 2;
+                        }
+                        start = unit.start;
+                    }
+                    app_size += size;
+                    provider_size += provider_char;
+                    end = unit.end;
+                    previous_span = Some((unit.start, unit.end));
+                    current.push(unit.ch);
+                }
+                source_offset += chunk.encode_utf16().count();
+                remaining = &remaining[end_byte..];
+            }
+            if !current.is_empty() {
+                parts.push(prepared_part(index, start, end, &current, &texts));
+                texts.push(current);
+            }
+        }
+        finish_checked(
+            &mut blocks,
+            chapter,
+            &self.profile,
+            &mut parts,
+            &mut texts,
+            budget,
+        )?;
+        blocks.retain(|block| !block.text.trim().is_empty());
+        Ok(blocks)
+    }
+
     #[must_use]
     pub fn plan_book(&self, book: &Book) -> Vec<AudioBlock> {
         book.chapters
@@ -275,52 +864,92 @@ impl ChapterPlanner {
 
     #[must_use]
     pub fn plan_text(&self, chapter: usize, text: &str) -> Vec<AudioBlock> {
-        self.plan_v1_text(chapter, text)
+        self.plan_impl(chapter, text, false)
     }
 
     // Keep this algorithm frozen for editions created before planner versioning.
     fn plan_v1_text(&self, chapter: usize, text: &str) -> Vec<AudioBlock> {
+        self.plan_impl(chapter, text, true)
+    }
+
+    fn plan_impl(&self, chapter: usize, text: &str, legacy: bool) -> Vec<AudioBlock> {
+        self.plan_impl_budgeted(chapter, text, legacy, None)
+            .unwrap_or_default()
+    }
+
+    fn plan_impl_budgeted(
+        &self,
+        chapter: usize,
+        text: &str,
+        legacy: bool,
+        mut budget: Option<&mut PlanningBudget>,
+    ) -> Result<Vec<AudioBlock>> {
         let limit = self.profile.escaped_byte_limit();
         let mut blocks = Vec::new();
         let mut parts = Vec::new();
         let mut texts = Vec::new();
         let mut bytes = 0;
-        for (index, passage) in split_passages(text).iter().enumerate() {
-            let units = prepare_units(&passage.text, passage.start, &self.rules);
+        for (index, passage) in crate::model::passage_iter(text).enumerate() {
             let mut current = String::new();
             let mut start = 0;
             let mut end = 0;
-            for unit in units {
-                let separator = if current.is_empty() && !parts.is_empty() {
-                    2
+            let mut remaining = passage.text.as_str();
+            let mut source_offset = passage.start;
+            while !remaining.is_empty() {
+                let end_byte = if self.rules.is_empty() {
+                    remaining
+                        .char_indices()
+                        .nth(MAX_PREPARED_UNITS)
+                        .map_or(remaining.len(), |(byte, _)| byte)
                 } else {
-                    0
+                    remaining.len()
                 };
-                let size = escaped_size(unit.ch);
-                if bytes + separator + size > limit
-                    || current.is_empty() && parts.len() >= AUDIO_BLOCK_MAX_PASSAGES
-                {
-                    if !current.is_empty() {
-                        parts.push(AudioPart {
-                            index,
-                            start,
-                            end,
-                            weight: weight(&current),
-                        });
-                        texts.push(std::mem::take(&mut current));
+                let chunk = &remaining[..end_byte];
+                let units = prepare_units(chunk, source_offset, &self.rules);
+                for unit in units {
+                    let separator = if current.is_empty() && !parts.is_empty() {
+                        2
+                    } else {
+                        0
+                    };
+                    let size = escaped_size(unit.ch);
+                    if bytes + separator + size > limit
+                        || current.is_empty() && parts.len() >= AUDIO_BLOCK_MAX_PASSAGES
+                    {
+                        if !current.is_empty() {
+                            parts.push(AudioPart {
+                                index,
+                                start,
+                                end,
+                                weight: weight(&current),
+                                synthesis_start: None,
+                                synthesis_end: None,
+                            });
+                            texts.push(std::mem::take(&mut current));
+                        }
+                        finish_optional_budget(
+                            &mut blocks,
+                            chapter,
+                            &self.profile,
+                            &mut parts,
+                            &mut texts,
+                            legacy,
+                            &mut budget,
+                        )?;
+                        bytes = 0;
                     }
-                    finish_block(&mut blocks, chapter, &self.profile, &mut parts, &mut texts);
-                    bytes = 0;
-                }
-                if current.is_empty() {
-                    if !parts.is_empty() {
-                        bytes += 2;
+                    if current.is_empty() {
+                        if !parts.is_empty() {
+                            bytes += 2;
+                        }
+                        start = unit.start;
                     }
-                    start = unit.start;
+                    bytes += size;
+                    end = unit.end;
+                    current.push(unit.ch);
                 }
-                bytes += size;
-                end = unit.end;
-                current.push(unit.ch);
+                source_offset += chunk.encode_utf16().count();
+                remaining = &remaining[end_byte..];
             }
             if !current.is_empty() {
                 parts.push(AudioPart {
@@ -328,13 +957,23 @@ impl ChapterPlanner {
                     start,
                     end,
                     weight: weight(&current),
+                    synthesis_start: None,
+                    synthesis_end: None,
                 });
                 texts.push(current);
             }
         }
-        finish_block(&mut blocks, chapter, &self.profile, &mut parts, &mut texts);
+        finish_optional_budget(
+            &mut blocks,
+            chapter,
+            &self.profile,
+            &mut parts,
+            &mut texts,
+            legacy,
+            &mut budget,
+        )?;
         blocks.retain(|block| block.text.chars().any(char::is_alphanumeric));
-        blocks
+        Ok(blocks)
     }
 }
 
@@ -348,7 +987,9 @@ pub fn plan_chapter_v1(book: &Book, chapter: usize, profile: &AudioProfile) -> V
 
 #[must_use]
 pub fn plan_chapter(book: &Book, chapter: usize, profile: &AudioProfile) -> Vec<AudioBlock> {
-    plan_chapter_v1(book, chapter, profile)
+    book.chapters.get(chapter).map_or_else(Vec::new, |source| {
+        ChapterPlanner::new(profile).plan_chapter(chapter, source)
+    })
 }
 
 #[must_use]
@@ -390,12 +1031,61 @@ pub struct CachedAudio {
     pub mime: String,
     pub size: u64,
 }
+#[derive(Debug, Clone)]
+pub struct CachedAudioBytes {
+    pub data: Vec<u8>,
+    pub mime: String,
+    pub timings: Vec<AudioTiming>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTiming {
+    pub start_utf16: usize,
+    pub end_utf16: usize,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+}
 #[derive(Debug, Serialize, Deserialize)]
 struct Metadata {
     mime: String,
     size: u64,
     digest: String,
     accessed: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_timings"
+    )]
+    timings: Vec<AudioTiming>,
+}
+
+fn deserialize_timings<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<AudioTiming>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+fn valid_timings(timings: &[AudioTiming]) -> bool {
+    if timings.len() > MAX_AUDIO_TIMINGS {
+        return false;
+    }
+    let mut previous_end = 0;
+    let mut previous_time = 0.0;
+    for timing in timings {
+        if timing.start_utf16 < previous_end
+            || timing.end_utf16 <= timing.start_utf16
+            || !timing.start_seconds.is_finite()
+            || !timing.end_seconds.is_finite()
+            || timing.start_seconds < previous_time
+            || timing.end_seconds < timing.start_seconds
+        {
+            return false;
+        }
+        previous_end = timing.end_utf16;
+        previous_time = timing.start_seconds;
+    }
+    true
 }
 #[derive(Debug, Clone, Copy)]
 struct CacheEntry {
@@ -543,35 +1233,74 @@ impl AudioCache {
     pub fn get(&self, id: &str) -> Result<Option<CachedAudio>> {
         validate_id(id)?;
         let _guard = self.lock();
-        let Some((audio, mut metadata)) = self.verified_locked(id)? else {
+        let Some((audio, metadata, _)) = self.verified_locked(id)? else {
             return Ok(None);
         };
-        let (_, metadata_path) = self.paths(id);
-        let blocks_dir = self.root.join("blocks");
-        let before = directory_stamp(&blocks_dir)?;
-        metadata.accessed = timestamp();
-        atomic_write(&metadata_path, &serde_json::to_vec(&metadata)?)?;
-        let after = directory_stamp(&blocks_dir)?;
-        let mut guard = self
-            .index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(index) = guard.as_mut() {
-            if before.is_some() && index.blocks_modified == before {
-                index.blocks_modified = after;
-                if let Some(entry) = index.entries.get_mut(id) {
-                    entry.accessed = metadata.accessed;
-                }
-            } else {
-                *guard = None;
-            }
-        }
-        drop(guard);
+        self.touch_locked(id, &metadata);
         Ok(Some(CachedAudio {
             path: audio,
             mime: metadata.mime,
             size: metadata.size,
         }))
+    }
+
+    /// Reads and verifies cached audio in one pass without requiring a metadata write.
+    ///
+    /// # Errors
+    /// Returns an error for invalid identifiers or audio read failures.
+    pub fn get_bytes(&self, id: &str) -> Result<Option<CachedAudioBytes>> {
+        validate_id(id)?;
+        let _guard = self.lock();
+        let Some((_, metadata, data)) = self.verified_locked(id)? else {
+            return Ok(None);
+        };
+        self.touch_locked(id, &metadata);
+        Ok(Some(CachedAudioBytes {
+            data,
+            mime: metadata.mime,
+            timings: metadata.timings,
+        }))
+    }
+
+    fn touch_locked(&self, id: &str, metadata: &Metadata) {
+        const TOUCH_INTERVAL_MS: u64 = 60_000;
+        let now = timestamp();
+        let updated = Metadata {
+            mime: metadata.mime.clone(),
+            size: metadata.size,
+            digest: metadata.digest.clone(),
+            accessed: now,
+            timings: metadata.timings.clone(),
+        };
+        let (_, metadata_path) = self.paths(id);
+        let blocks_dir = self.root.join("blocks");
+        let mut stamps = None;
+        if now.saturating_sub(metadata.accessed) >= TOUCH_INTERVAL_MS {
+            let before = directory_stamp(&blocks_dir).ok().flatten();
+            if let Ok(data) = serde_json::to_vec(&updated)
+                && atomic_write(&metadata_path, &data).is_ok()
+            {
+                stamps = Some((before, directory_stamp(&blocks_dir).ok().flatten()));
+            }
+        }
+        let mut guard = self
+            .index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = guard.as_mut() {
+            if let Some((before, after)) = stamps {
+                if before.is_some() && index.blocks_modified == before {
+                    index.blocks_modified = after;
+                } else {
+                    *guard = None;
+                    return;
+                }
+            }
+            if let Some(entry) = index.entries.get_mut(id) {
+                entry.accessed = now;
+            }
+        }
+        drop(guard);
     }
 
     /// Verifies one cached block without changing its LRU timestamp.
@@ -581,13 +1310,15 @@ impl AudioCache {
     pub fn verify(&self, id: &str) -> Result<Option<u64>> {
         validate_id(id)?;
         let _guard = self.lock();
-        Ok(self.verified_locked(id)?.map(|(_, metadata)| metadata.size))
+        Ok(self
+            .verified_locked(id)?
+            .map(|(_, metadata, _)| metadata.size))
     }
 
-    fn verified_locked(&self, id: &str) -> Result<Option<(PathBuf, Metadata)>> {
+    fn verified_locked(&self, id: &str) -> Result<Option<(PathBuf, Metadata, Vec<u8>)>> {
         let (audio, metadata_path) = self.paths(id);
         match fs::metadata(&metadata_path) {
-            Ok(info) if info.len() <= 16 * 1024 => {}
+            Ok(info) if info.len() <= MAX_AUDIO_METADATA_BYTES => {}
             Ok(_) => return Ok(None),
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -597,7 +1328,7 @@ impl AudioCache {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let Ok(metadata) = serde_json::from_slice::<Metadata>(&metadata) else {
+        let Ok(mut metadata) = serde_json::from_slice::<Metadata>(&metadata) else {
             return Ok(None);
         };
         if metadata.size == 0
@@ -606,6 +1337,9 @@ impl AudioCache {
             || !valid_mime(&metadata.mime)
         {
             return Ok(None);
+        }
+        if !valid_timings(&metadata.timings) {
+            metadata.timings.clear();
         }
         match fs::metadata(&audio) {
             Ok(info) if info.len() == metadata.size => {}
@@ -623,7 +1357,7 @@ impl AudioCache {
         {
             return Ok(None);
         }
-        Ok(Some((audio, metadata)))
+        Ok(Some((audio, metadata, data)))
     }
 
     /// Returns cached audio sizes without reading audio data or updating LRU.
@@ -639,7 +1373,7 @@ impl AudioCache {
             validate_id(id)?;
             let (audio, meta) = self.paths(id);
             let meta_info = match fs::metadata(&meta) {
-                Ok(info) if info.len() <= 16 * 1024 => info,
+                Ok(info) if info.len() <= MAX_AUDIO_METADATA_BYTES => info,
                 Ok(_) => {
                     sizes.push(None);
                     continue;
@@ -680,8 +1414,24 @@ impl AudioCache {
     /// Returns an error for invalid identifiers, audio, or filesystem failures.
     #[allow(clippy::significant_drop_tightening)]
     pub fn put(&self, id: &str, mime: &str, data: &[u8]) -> Result<CachedAudio> {
+        self.put_with_timings(id, mime, data, &[])
+    }
+
+    /// Persists an audio block and validated word timings together.
+    ///
+    /// # Errors
+    /// Returns an error for invalid audio, timings or filesystem failures.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn put_with_timings(
+        &self,
+        id: &str,
+        mime: &str,
+        data: &[u8],
+        timings: &[AudioTiming],
+    ) -> Result<CachedAudio> {
         validate_id(id)?;
-        if data.is_empty() || data.len() > MAX_AUDIO || !valid_mime(mime) {
+        if data.is_empty() || data.len() > MAX_AUDIO || !valid_mime(mime) || !valid_timings(timings)
+        {
             return Err(Error::Format("Некорректное аудио для кеша".into()));
         }
         let _guard = self.lock();
@@ -692,6 +1442,7 @@ impl AudioCache {
             size: data.len() as u64,
             digest: hash_parts(&[data]),
             accessed: timestamp(),
+            timings: timings.to_vec(),
         };
         let write_result = atomic_write(&path, data)
             .and_then(|()| atomic_write(&meta, &serde_json::to_vec(&metadata)?));
@@ -1172,7 +1923,7 @@ impl AudioCache {
                 }
                 Err(error) => return Err(error.into()),
             };
-            let parsed = if fs::metadata(&path)?.len() <= 16 * 1024 {
+            let parsed = if fs::metadata(&path)?.len() <= MAX_AUDIO_METADATA_BYTES {
                 serde_json::from_slice::<Metadata>(&fs::read(&path)?).ok()
             } else {
                 None
@@ -1340,6 +2091,197 @@ mod tests {
     }
 
     #[test]
+    fn checked_planner_honors_typed_limits_and_unicode_boundaries() {
+        let mut profile = AudioProfile::from_preferences(&Preferences::default());
+        profile.dictionary.insert("мир".into(), "СВІТ".into());
+        profile.synthesis = Some(SynthesisSettings {
+            input_limit: Some(InputLimit {
+                unit: InputUnit::Character,
+                value: 12,
+                source: LimitSource::User,
+                verified_at: None,
+            }),
+            ..SynthesisSettings::default()
+        });
+        let planner = ChapterPlanner::try_new(&profile).unwrap();
+        let blocks = planner
+            .try_plan_text(0, "мир мирний. мир! 😀 тағы.")
+            .unwrap();
+        assert!(blocks.iter().all(|block| block.text.chars().count() <= 12));
+        for block in &blocks {
+            for part in &block.passages {
+                let (start, end) = (part.synthesis_start.unwrap(), part.synthesis_end.unwrap());
+                assert!(start < end && end <= block.text.encode_utf16().count());
+            }
+        }
+        let text = blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("СВІТ мирний"));
+        assert!(!text.contains("СВІТний"));
+    }
+
+    #[test]
+    fn checked_planner_respects_utf8_limit_and_keeps_fitting_words_whole() {
+        let mut profile = AudioProfile::from_preferences(&Preferences::default());
+        profile.synthesis = Some(SynthesisSettings {
+            input_limit: Some(InputLimit {
+                unit: InputUnit::Utf8Byte,
+                value: 7,
+                source: LimitSource::Provider,
+                verified_at: Some(1),
+            }),
+            ..SynthesisSettings::default()
+        });
+        let blocks = ChapterPlanner::try_new(&profile)
+            .unwrap()
+            .try_plan_text(0, "one two three 😀")
+            .unwrap();
+        assert!(blocks.iter().all(|block| block.text.len() <= 7));
+        let joined = blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(joined.iter().any(|text| text.contains("three")));
+        assert!(joined.iter().any(|text| text.contains('😀')));
+        if let Some(settings) = profile.synthesis.as_mut() {
+            settings.input_limit.as_mut().unwrap().value = 3;
+        }
+        assert!(
+            ChapterPlanner::try_new(&profile)
+                .unwrap()
+                .try_plan_text(0, "😀")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tiny_model_limit_stops_before_allocating_unbounded_block_count() {
+        let mut profile = AudioProfile::from_preferences(&Preferences::default());
+        profile.synthesis = Some(SynthesisSettings {
+            input_limit: Some(InputLimit {
+                unit: InputUnit::Character,
+                value: 1,
+                source: LimitSource::User,
+                verified_at: None,
+            }),
+            ..SynthesisSettings::default()
+        });
+        let planner = ChapterPlanner::try_new(&profile).unwrap();
+        let mut budget = PlanningBudget::default();
+        assert!(
+            planner
+                .try_plan_text_budgeted(0, &"x".repeat(100_000), &mut budget)
+                .is_err()
+        );
+        assert_eq!(budget.blocks, MAX_PLANNED_BLOCKS + 1);
+        assert!(budget.owned_bytes < MAX_PLAN_OWNED_BYTES);
+    }
+
+    #[test]
+    fn legacy_v1_chunk_boundary_keeps_original_ids_and_offsets() {
+        let profile = AudioProfile::from_preferences(&Preferences::default());
+        let input = "a".repeat(MAX_PREPARED_UNITS + 1);
+        let planned = plan_chapter_v1(&book(&input), 0, &profile);
+        let expected_id = canonical_block_id(&"a".repeat(AUDIO_BLOCK_MAX_ESCAPED_BYTES), &profile);
+        assert_eq!(planned[0].id, expected_id);
+        assert_eq!(
+            (planned[0].start, planned[0].end),
+            (0, AUDIO_BLOCK_MAX_ESCAPED_BYTES)
+        );
+        assert_eq!(planned.last().unwrap().end, input.len());
+        assert!(planned.iter().all(|block| {
+            block
+                .passages
+                .iter()
+                .all(|part| part.synthesis_start.is_none())
+        }));
+    }
+
+    #[test]
+    fn expanding_dictionary_is_limited_during_block_emission() {
+        let mut profile = AudioProfile::from_preferences(&Preferences::default());
+        profile.max_escaped_bytes = Some(6);
+        profile.dictionary.insert("x".into(), "yy".into());
+        let planner = ChapterPlanner::try_new(&profile).unwrap();
+        let mut budget = PlanningBudget::default();
+        assert!(
+            planner
+                .try_plan_text_budgeted(0, &"x ".repeat(MAX_PLANNED_BLOCKS * 3), &mut budget)
+                .is_err()
+        );
+        assert!(budget.blocks <= MAX_PLANNED_BLOCKS + 1);
+        assert!(budget.owned_bytes <= MAX_PLAN_OWNED_BYTES);
+    }
+
+    #[test]
+    fn checked_planner_rejects_large_dictionary_expansion_and_unsplittable_replacement() {
+        let mut profile = AudioProfile::from_preferences(&Preferences::default());
+        profile.dictionary.insert("x".into(), "y".repeat(200));
+        profile.synthesis = Some(SynthesisSettings {
+            input_limit: Some(InputLimit {
+                unit: InputUnit::Character,
+                value: 20,
+                source: LimitSource::User,
+                verified_at: None,
+            }),
+            ..SynthesisSettings::default()
+        });
+        assert!(
+            ChapterPlanner::try_new(&profile)
+                .unwrap()
+                .try_plan_text(0, "x")
+                .is_err()
+        );
+        profile.dictionary = (0..=MAX_DICTIONARY_ENTRIES)
+            .map(|i| (format!("x{i}"), "y".into()))
+            .collect();
+        assert!(ChapterPlanner::try_new(&profile).is_err());
+    }
+
+    #[test]
+    fn long_passage_with_single_word_dictionary_is_chunked_without_losing_text() {
+        let mut profile = AudioProfile::from_preferences(&Preferences::default());
+        profile.dictionary.insert("кот".into(), "кіт".into());
+        let source = "кот ".repeat(65_000);
+        let blocks = ChapterPlanner::try_new(&profile)
+            .unwrap()
+            .try_plan_text(0, &source)
+            .unwrap();
+        let actual: String = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(actual, "кіт ".repeat(65_000).trim());
+        let source_len = source.encode_utf16().count();
+        assert!(blocks.iter().all(|block| block.end <= source_len));
+    }
+
+    #[test]
+    fn resource_identity_changes_audio_id_without_changing_legacy_profiles() {
+        let old = AudioProfile::from_preferences(&Preferences::default());
+        let serialized = serde_json::to_value(&old).unwrap();
+        assert!(serialized.get("synthesis").is_none());
+        let text = "Пример.";
+        let legacy_id = canonical_block_id(text, &old);
+        let mut changed = old;
+        changed.synthesis = Some(SynthesisSettings {
+            resource_revision: Some("v2".into()),
+            ..SynthesisSettings::default()
+        });
+        assert_ne!(canonical_block_id(text, &changed), legacy_id);
+        changed.synthesis = Some(SynthesisSettings {
+            input_limit: Some(InputLimit {
+                unit: InputUnit::Character,
+                value: 7,
+                source: LimitSource::User,
+                verified_at: None,
+            }),
+            ..SynthesisSettings::default()
+        });
+        assert_eq!(canonical_block_id(text, &changed), legacy_id);
+    }
+
+    #[test]
     fn respects_model_limit_and_reuses_equal_audio_across_books() {
         let mut profile = AudioProfile::from_preferences(&Preferences::default());
         profile.max_escaped_bytes = Some(20);
@@ -1406,6 +2348,86 @@ mod tests {
             .remove_manifest(&manifest.book_id, &manifest.profile_id)
             .unwrap();
         assert!(cache.list_manifests().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_audio_bytes_do_not_rewrite_recent_lru_metadata() {
+        let root = fixture();
+        let cache = AudioCache::new(root.clone()).unwrap();
+        let profile = AudioProfile::from_preferences(&Preferences::default());
+        let id = plan_chapter(&book("Текст."), 0, &profile)[0].id.clone();
+        cache.put(&id, "audio/mpeg", b"audio-data").unwrap();
+        let (_, metadata) = cache.paths(&id);
+        let before = fs::read(&metadata).unwrap();
+        let result = cache.get_bytes(&id).unwrap().unwrap();
+        assert_eq!(result.data, b"audio-data");
+        assert_eq!(result.mime, "audio/mpeg");
+        assert_eq!(result.timings, Vec::<AudioTiming>::new());
+        assert_eq!(fs::read(&metadata).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_timings_roundtrip_and_reject_invalid_alignment() {
+        let root = fixture();
+        let cache = AudioCache::new(root.clone()).unwrap();
+        let id = "a".repeat(64);
+        let timing = AudioTiming {
+            start_utf16: 0,
+            end_utf16: 3,
+            start_seconds: 0.1,
+            end_seconds: 0.5,
+        };
+        cache
+            .put_with_timings(&id, "audio/mpeg", b"audio", std::slice::from_ref(&timing))
+            .unwrap();
+        assert_eq!(
+            cache.get_bytes(&id).unwrap().unwrap().timings,
+            vec![timing.clone()]
+        );
+        let invalid = AudioTiming {
+            start_seconds: f64::NAN,
+            ..timing
+        };
+        assert!(
+            cache
+                .put_with_timings(&id, "audio/mpeg", b"other", &[invalid])
+                .is_err()
+        );
+        assert_eq!(cache.get_bytes(&id).unwrap().unwrap().data, b"audio");
+        let (_, path) = cache.paths(&id);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        metadata["timings"][0]["endSeconds"] = serde_json::json!(-1.0);
+        fs::write(path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let recovered = cache.get_bytes(&id).unwrap().unwrap();
+        assert_eq!(recovered.data, b"audio");
+        assert_eq!(recovered.timings, Vec::<AudioTiming>::new());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_read_survives_read_only_lru_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fixture();
+        let cache = AudioCache::new(root.clone()).unwrap();
+        let id = "b".repeat(64);
+        cache.put(&id, "audio/mpeg", b"audio").unwrap();
+        let (_, path) = cache.paths(&id);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        metadata["accessed"] = serde_json::json!(0);
+        fs::write(path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let blocks = cache.root.join("blocks");
+        fs::set_permissions(&blocks, fs::Permissions::from_mode(0o500)).unwrap();
+        let readonly = fs::File::create(blocks.join("probe.tmp")).is_err();
+        let result = cache.get_bytes(&id);
+        fs::set_permissions(&blocks, fs::Permissions::from_mode(0o700)).unwrap();
+        if readonly {
+            assert_eq!(result.unwrap().unwrap().data, b"audio");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

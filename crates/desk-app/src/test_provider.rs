@@ -2,6 +2,7 @@
 
 use readio_speech::{SpeechAudio, SpeechError};
 use std::{
+    collections::{HashMap, VecDeque},
     future::Future,
     sync::{
         Arc, Mutex,
@@ -16,6 +17,9 @@ pub struct MockSpeech {
     count: watch::Sender<usize>,
     hold: AtomicBool,
     released: Semaphore,
+    price: Mutex<(String, String, bool)>,
+    next_costs: Mutex<VecDeque<Option<String>>>,
+    costs: Mutex<HashMap<String, Option<String>>>,
 }
 
 impl MockSpeech {
@@ -26,9 +30,39 @@ impl MockSpeech {
             count,
             hold: AtomicBool::new(false),
             released: Semaphore::new(0),
+            price: Mutex::new(("0.01".into(), "0".into(), false)),
+            next_costs: Mutex::new(VecDeque::new()),
+            costs: Mutex::new(HashMap::new()),
         })
     }
 
+    pub(crate) fn set_price(&self, prompt: &str, completion: &str, free: bool) {
+        *self.price.lock().unwrap() = (prompt.into(), completion.into(), free);
+    }
+    pub(crate) fn price(&self) -> (String, String, bool) {
+        self.price.lock().unwrap().clone()
+    }
+    pub(crate) fn push_usage(&self, value: Option<&str>) {
+        self.next_costs
+            .lock()
+            .unwrap()
+            .push_back(value.map(str::to_owned));
+    }
+    pub(crate) fn set_usage(&self, id: &str, value: Option<&str>) {
+        self.costs
+            .lock()
+            .unwrap()
+            .insert(id.into(), value.map(str::to_owned));
+    }
+    pub(crate) fn usage(&self, id: &str) -> Result<String, String> {
+        self.costs
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| "Расход ещё неизвестен".into())
+    }
     pub(crate) fn hold(&self) {
         self.hold.store(true, Ordering::Release);
     }
@@ -55,12 +89,21 @@ impl MockSpeech {
         F: FnOnce(Option<String>) -> Fut + Send,
         Fut: Future<Output = Result<(), SpeechError>> + Send,
     {
-        {
+        let count = {
             let mut calls = self.calls.lock().unwrap();
             calls.push(block_id.to_owned());
-            self.count.send_replace(calls.len());
-        }
-        on_response(Some("gen-test".into())).await?;
+            calls.len()
+        };
+        let id = format!("gen-test-{count}");
+        let cost = self
+            .next_costs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Some("0".into()));
+        self.costs.lock().unwrap().insert(id.clone(), cost);
+        on_response(Some(id)).await?;
+        self.count.send_replace(count);
         if self.hold.load(Ordering::Acquire) {
             self.released
                 .acquire()
@@ -72,6 +115,7 @@ impl MockSpeech {
             data: "bXAzLXRlc3Q=".into(),
             mime: "audio/mpeg".into(),
             playback_rate: 1.0,
+            timings: Vec::new(),
         })
     }
 }

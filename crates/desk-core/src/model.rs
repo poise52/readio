@@ -30,6 +30,8 @@ pub struct Book {
     pub chapter: usize,
     pub offset: usize,
     pub speed: f32,
+    #[serde(default, rename = "audioPosition")]
+    pub audio_position: Option<AudioPosition>,
     pub marks: Vec<Mark>,
     #[serde(default, skip_deserializing)]
     pub passages: Vec<Passage>,
@@ -47,6 +49,7 @@ impl Default for Book {
             chapter: 0,
             offset: 0,
             speed: 1.0,
+            audio_position: None,
             marks: Vec::new(),
             passages: Vec::new(),
             progress: 0.0,
@@ -79,9 +82,19 @@ pub struct ReaderBook {
     pub chapter: usize,
     pub offset: usize,
     pub speed: f32,
+    #[serde(rename = "audioPosition")]
+    pub audio_position: Option<AudioPosition>,
     pub marks: Vec<Mark>,
     pub passages: Vec<Passage>,
     pub progress: f64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioPosition {
+    pub chapter: usize,
+    pub block_id: String,
+    pub profile_id: String,
+    pub seconds: f64,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,50 +147,56 @@ impl Book {
 }
 #[must_use]
 pub fn split_passages(input: &str) -> Vec<Passage> {
-    let mut result = Vec::new();
+    passage_iter(input).collect()
+}
+
+pub fn passage_iter(input: &str) -> impl Iterator<Item = Passage> + '_ {
     let mut start = 0;
     let mut utf16 = 0;
-    let chars: Vec<(usize, char)> = input.char_indices().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let (byte, ch) = chars[i];
-        if matches!(ch, '.' | '!' | '?' | '…' | '\n') {
-            let end_byte = if ch == '\n' {
-                byte
-            } else {
-                let mut j = i + 1;
-                while j < chars.len()
-                    && matches!(
-                        chars[j].1,
-                        '.' | '!' | '?' | '…' | '”' | '»' | '"' | '\'' | ')'
-                    )
-                {
-                    j += 1;
+    let mut chars = input.char_indices().peekable();
+    let mut done = false;
+    std::iter::from_fn(move || {
+        while !done {
+            let (end, next) = loop {
+                let Some((byte, ch)) = chars.next() else {
+                    done = true;
+                    break (input.len(), input.len());
+                };
+                if ch == '\n' {
+                    break (byte, byte + 1);
                 }
-                i = j - 1;
-                chars.get(j).map_or(input.len(), |(b, _)| *b)
+                if matches!(ch, '.' | '!' | '?' | '…') {
+                    while chars.peek().is_some_and(|(_, next)| {
+                        matches!(next, '.' | '!' | '?' | '…' | '”' | '»' | '"' | '\'' | ')')
+                    }) {
+                        chars.next();
+                    }
+                    let next = chars.peek().map_or(input.len(), |(byte, _)| *byte);
+                    break (next, next);
+                }
             };
-            push_passage(&mut result, &input[start..end_byte], utf16);
-            let next = if ch == '\n' { byte + 1 } else { end_byte };
+            let result = make_passage(&input[start..end], utf16);
             utf16 += input[start..next].encode_utf16().count();
             start = next;
+            if result.is_some() {
+                return result;
+            }
         }
-        i += 1;
-    }
-    push_passage(&mut result, &input[start..], utf16);
-    result
+        None
+    })
 }
-fn push_passage(result: &mut Vec<Passage>, raw: &str, offset: usize) {
+fn make_passage(raw: &str, offset: usize) -> Option<Passage> {
     let text = raw.trim();
-    if !text.is_empty() {
-        let leading = raw.len() - raw.trim_start().len();
-        let start = offset + raw[..leading].encode_utf16().count();
-        result.push(Passage {
-            start,
-            end: start + text.encode_utf16().count(),
-            text: text.to_owned(),
-        });
+    if text.is_empty() {
+        return None;
     }
+    let leading = raw.len() - raw.trim_start().len();
+    let start = offset + raw[..leading].encode_utf16().count();
+    Some(Passage {
+        start,
+        end: start + text.encode_utf16().count(),
+        text: text.to_owned(),
+    })
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -202,6 +221,8 @@ pub struct Preferences {
     pub open_router_model: Option<String>,
     pub open_router_voice: Option<String>,
     pub open_router_billing_units: BTreeMap<String, BillingUnit>,
+    #[serde(default)]
+    pub open_router_model_settings: BTreeMap<String, crate::SynthesisSettings>,
     #[serde(default = "default_volume")]
     pub volume: f64,
     pub dictionary: BTreeMap<String, String>,
@@ -227,6 +248,7 @@ impl Default for Preferences {
             open_router_model: None,
             open_router_voice: None,
             open_router_billing_units: BTreeMap::new(),
+            open_router_model_settings: BTreeMap::new(),
             volume: default_volume(),
             dictionary: BTreeMap::new(),
         }
@@ -235,6 +257,70 @@ impl Default for Preferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_split(input: &str) -> Vec<Passage> {
+        let chars: Vec<_> = input.char_indices().collect();
+        let mut result = Vec::new();
+        let (mut start, mut utf16, mut i) = (0, 0, 0);
+        while i < chars.len() {
+            let (byte, ch) = chars[i];
+            if matches!(ch, '.' | '!' | '?' | '…' | '\n') {
+                let end = if ch == '\n' {
+                    byte
+                } else {
+                    let mut j = i + 1;
+                    while j < chars.len()
+                        && matches!(
+                            chars[j].1,
+                            '.' | '!' | '?' | '…' | '”' | '»' | '"' | '\'' | ')'
+                        )
+                    {
+                        j += 1;
+                    }
+                    i = j - 1;
+                    chars.get(j).map_or(input.len(), |(byte, _)| *byte)
+                };
+                if let Some(passage) = make_passage(&input[start..end], utf16) {
+                    result.push(passage);
+                }
+                let next = if ch == '\n' { byte + 1 } else { end };
+                utf16 += input[start..next].encode_utf16().count();
+                start = next;
+            }
+            i += 1;
+        }
+        if let Some(passage) = make_passage(&input[start..], utf16) {
+            result.push(passage);
+        }
+        result
+    }
+
+    #[test]
+    fn streaming_passages_match_legacy_on_unicode_and_punctuation() {
+        let alphabet = [
+            'а', 'і', 'é', '\u{301}', '😀', ' ', '\n', '\r', '.', '!', '?', '…', '”', '»', '"',
+            '\'', ')', '\t',
+        ];
+        let mut seed = 0x91ab_3c67_u64;
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let length = (seed % 70) as usize;
+            for _ in 0..length {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                text.push(alphabet[usize::try_from(seed % 18).unwrap_or_default()]);
+            }
+            let actual: Vec<_> = split_passages(&text)
+                .into_iter()
+                .map(|p| (p.start, p.end, p.text))
+                .collect();
+            let expected: Vec<_> = legacy_split(&text)
+                .into_iter()
+                .map(|p| (p.start, p.end, p.text))
+                .collect();
+            assert_eq!(actual, expected, "{text:?}");
+        }
+    }
     #[test]
     fn legacy_preferences_default_openrouter_voice() -> Result<(), serde_json::Error> {
         let prefs: Preferences = serde_json::from_str(r#"{"dark":false}"#)?;
@@ -246,6 +332,15 @@ mod tests {
                 .is_some()
         );
         assert_eq!(prefs.volume, 1.0);
+        assert_eq!(prefs.open_router_model_settings, BTreeMap::new());
+        assert_eq!(
+            serde_json::to_value(&prefs)?["openRouterModelSettings"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            serde_json::to_value(Preferences::default())?["openRouterModelSettings"],
+            serde_json::json!({})
+        );
         Ok(())
     }
     #[test]

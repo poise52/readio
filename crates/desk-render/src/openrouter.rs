@@ -5,7 +5,7 @@ use reqwest::{
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER},
     redirect::Policy,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{MAX_AUDIO_BYTES, SpeechError};
 
@@ -13,6 +13,80 @@ const ENDPOINT: &str = "https://openrouter.ai/api/v1/audio/speech";
 const CATALOG: &str = "https://openrouter.ai/api/v1/models?output_modalities=speech";
 const USER_CATALOG: &str = "https://openrouter.ai/api/v1/models/user?output_modalities=speech";
 const MAX_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+const GENERATION: &str = "https://openrouter.ai/api/v1/generation";
+
+pub async fn generation_cost(client: &Client, key: &str, id: &str) -> Result<String, SpeechError> {
+    if !safe_generation_id(id) {
+        return Err(SpeechError::Engine(
+            "Некорректный идентификатор генерации".into(),
+        ));
+    }
+    let response = client
+        .get(format!("{GENERATION}?id={id}"))
+        .header(AUTHORIZATION, authorization(key)?)
+        .send()
+        .await
+        .map_err(|_| SpeechError::Engine("Не удалось проверить расход OpenRouter".into()))?;
+    if !response.status().is_success() {
+        return Err(status_error(
+            response.status(),
+            response.headers().get(RETRY_AFTER),
+        ));
+    }
+    let bytes = bounded_body(response, 256 * 1024).await?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+        SpeechError::Engine("OpenRouter вернул некорректные сведения о расходе".into())
+    })?;
+    value["data"]["total_cost"]
+        .as_number()
+        .map(ToString::to_string)
+        .ok_or_else(|| SpeechError::Engine("OpenRouter пока не сообщил расход генерации".into()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioFormat {
+    Mp3,
+    Pcm,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTransport {
+    pub format: AudioFormat,
+    pub pcm_sample_rate: Option<u32>,
+    pub pcm_channels: Option<u16>,
+}
+
+impl Default for AudioTransport {
+    fn default() -> Self {
+        Self {
+            format: AudioFormat::Mp3,
+            pcm_sample_rate: None,
+            pcm_channels: None,
+        }
+    }
+}
+
+impl AudioTransport {
+    /// Checks whether raw PCM can be decoded without guessing its parameters.
+    ///
+    /// # Errors
+    /// Returns an error when the PCM rate or channel count is unsupported.
+    pub fn validate(self) -> Result<(), SpeechError> {
+        if self.format == AudioFormat::Pcm
+            && (!self
+                .pcm_sample_rate
+                .is_some_and(|r| (8_000..=192_000).contains(&r))
+                || self.pcm_channels != Some(1))
+        {
+            return Err(SpeechError::Engine(
+                "Для PCM укажите частоту 8000–192000 Гц и один канал до синтеза".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +101,7 @@ pub struct OpenRouterPricing {
 #[serde(rename_all = "camelCase")]
 pub struct OpenRouterModel {
     pub id: String,
+    pub canonical_slug: Option<String>,
     pub name: String,
     pub description: String,
     pub pricing: OpenRouterPricing,
@@ -161,6 +236,10 @@ fn parse_catalog(bytes: &[u8]) -> Result<Vec<OpenRouterModel>, SpeechError> {
         });
         models.push(OpenRouterModel {
             id: id.into(),
+            canonical_slug: entry["canonical_slug"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
             name: entry["name"].as_str().unwrap_or(id).into(),
             description: entry["description"].as_str().unwrap_or("").into(),
             pricing: OpenRouterPricing {
@@ -181,6 +260,7 @@ pub async fn synthesize<F, Fut>(
     api_key: &str,
     model: &str,
     voice: Option<&str>,
+    transport: AudioTransport,
     on_response: F,
 ) -> Result<(Vec<u8>, &'static str), SpeechError>
 where
@@ -195,6 +275,7 @@ where
         model,
         voice,
         MAX_AUDIO_BYTES,
+        transport,
         on_response,
     )
     .await
@@ -218,27 +299,6 @@ pub fn validate_request(
     authorization(api_key)
 }
 
-fn pcm_only(model: &str) -> bool {
-    model.starts_with("heygen/") || (model.starts_with("google/gemini-") && model.contains("tts"))
-}
-fn pcm_default_rate(model: &str) -> Option<u32> {
-    if model.starts_with("heygen/heygen-voice-1") {
-        Some(44_100)
-    } else if [
-        "google/gemini-2.5-",
-        "google/gemini-3.1-",
-        "google/gemini-3.8-",
-    ]
-    .iter()
-    .any(|prefix| model.starts_with(prefix))
-        && model.contains("tts")
-    {
-        Some(24_000)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 async fn send(
     client: &Client,
@@ -257,6 +317,7 @@ async fn send(
         model,
         voice,
         audio_limit,
+        AudioTransport::default(),
         |_| async { Ok(()) },
     )
     .await
@@ -271,6 +332,7 @@ async fn send_tracked<F, Fut>(
     model: &str,
     voice: Option<&str>,
     audio_limit: usize,
+    transport: AudioTransport,
     on_response: F,
 ) -> Result<(Vec<u8>, &'static str), SpeechError>
 where
@@ -278,7 +340,11 @@ where
     Fut: Future<Output = Result<(), SpeechError>> + Send,
 {
     let auth = validate_request(api_key, model, voice)?;
-    let response_format = if pcm_only(model) { "pcm" } else { "mp3" };
+    transport.validate()?;
+    let response_format = match transport.format {
+        AudioFormat::Mp3 => "mp3",
+        AudioFormat::Pcm => "pcm",
+    };
     let request = SpeechRequest {
         model,
         input: text,
@@ -332,7 +398,7 @@ where
         ));
     }
     let audio = bounded_body(response, audio_limit).await?;
-    decode_audio(audio, &content_type, model)
+    decode_audio(audio, &content_type, transport)
 }
 
 fn safe_generation_id(value: &str) -> bool {
@@ -347,7 +413,7 @@ fn safe_generation_id(value: &str) -> bool {
 fn decode_audio(
     audio: Vec<u8>,
     content_type: &str,
-    model: &str,
+    transport: AudioTransport,
 ) -> Result<(Vec<u8>, &'static str), SpeechError> {
     if audio.is_empty() {
         return Err(SpeechError::Engine("OpenRouter вернул пустое аудио".into()));
@@ -365,7 +431,7 @@ fn decode_audio(
         ));
     }
     if media_type.eq_ignore_ascii_case("audio/pcm") {
-        let rate = pcm_rate(content_type, model)?;
+        let rate = pcm_rate(content_type, transport)?;
         if !audio.len().is_multiple_of(2) {
             return Err(SpeechError::Engine(
                 "OpenRouter вернул повреждённое PCM-аудио".into(),
@@ -426,7 +492,7 @@ fn valid_wav(data: &[u8]) -> bool {
     cursor == end && has_format && has_audio
 }
 
-fn pcm_rate(content_type: &str, model: &str) -> Result<u32, SpeechError> {
+fn pcm_rate(content_type: &str, transport: AudioTransport) -> Result<u32, SpeechError> {
     let mut rate = None;
     let mut channels = None;
     for parameter in content_type.split(';').skip(1) {
@@ -449,12 +515,12 @@ fn pcm_rate(content_type: &str, model: &str) -> Result<u32, SpeechError> {
             channels = Some(value == "1");
         }
     }
-    if channels == Some(false) || (channels.is_none() && pcm_default_rate(model).is_none()) {
+    if channels == Some(false) || (channels.is_none() && transport.pcm_channels != Some(1)) {
         return Err(SpeechError::Engine(
             "OpenRouter не подтвердил моно PCM".into(),
         ));
     }
-    rate.or_else(|| pcm_default_rate(model))
+    rate.or(transport.pcm_sample_rate)
         .ok_or_else(|| SpeechError::Engine("OpenRouter не указал частоту PCM-аудио".into()))
 }
 
@@ -602,32 +668,36 @@ mod tests {
     fn detects_wave_container_in_pcm_response() {
         let wav = crate::pcm_to_wav(&[1, 2, 3, 4], 24_000).unwrap();
         let (decoded, mime) =
-            decode_audio(wav.clone(), "audio/pcm", "google/gemini-3.8-flash-tts").unwrap();
+            decode_audio(wav.clone(), "audio/pcm", AudioTransport::default()).unwrap();
         assert_eq!(mime, "audio/wav");
         assert_eq!(decoded, wav);
         let mut truncated = wav;
         truncated.pop();
-        assert!(decode_audio(truncated, "audio/pcm", "google/gemini-3.8-flash-tts").is_err());
+        assert!(decode_audio(truncated, "audio/pcm", AudioTransport::default()).is_err());
     }
 
     #[test]
-    fn pcm_metadata_accepts_only_known_mono_rates() {
+    fn pcm_metadata_uses_headers_or_explicit_settings() {
+        let explicit = AudioTransport {
+            format: AudioFormat::Pcm,
+            pcm_sample_rate: Some(44_100),
+            pcm_channels: Some(1),
+        };
         assert_eq!(
-            pcm_rate("audio/pcm; rate=48000; channels=1", "unknown").unwrap(),
+            pcm_rate("audio/pcm; rate=48000; channels=1", explicit).unwrap(),
             48_000
         );
-        assert_eq!(
-            pcm_rate("audio/pcm", "google/gemini-3.8-flash-tts").unwrap(),
-            24_000
+        assert_eq!(pcm_rate("audio/pcm", explicit).unwrap(), 44_100);
+        assert!(pcm_rate("audio/pcm", AudioTransport::default()).is_err());
+        assert!(pcm_rate("audio/pcm; rate=24000; channels=2", explicit).is_err());
+        assert!(
+            AudioTransport {
+                format: AudioFormat::Pcm,
+                ..AudioTransport::default()
+            }
+            .validate()
+            .is_err()
         );
-        assert_eq!(
-            pcm_rate("audio/pcm", "heygen/heygen-voice-1").unwrap(),
-            44_100
-        );
-        assert!(pcm_rate("audio/pcm", "unknown").is_err());
-        assert!(pcm_rate("audio/pcm", "google/gemini-9.0-tts").is_err());
-        assert!(pcm_rate("audio/pcm", "heygen/voice-9").is_err());
-        assert!(pcm_rate("audio/pcm; rate=24000; channels=2", "unknown").is_err());
     }
 
     #[tokio::test]
@@ -640,7 +710,7 @@ mod tests {
             let (url, server_task) = server(reply).await;
             let recorded = Arc::new(Mutex::new(None));
             let target = Arc::clone(&recorded);
-            let result = send_tracked(&test_client(), &url, "text", "key", MODEL, None, 1024, move |id| async move {
+            let result = send_tracked(&test_client(), &url, "text", "key", MODEL, None, 1024, AudioTransport::default(), move |id| async move {
                 *target.lock().unwrap() = id;
                 Ok(())
             }).await;
@@ -659,9 +729,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_pcm_for_gemini_and_wraps_as_wav() {
+    async fn sends_explicit_pcm_and_wraps_as_wav() {
         let (url, request) = server(b"HTTP/1.1 200 OK\r\nContent-Type: audio/pcm;rate=24000;channels=1\r\nContent-Length: 4\r\nConnection: close\r\n\r\n1234").await;
-        let (audio, mime) = send(
+        let (audio, mime) = send_tracked(
             &test_client(),
             &url,
             "text",
@@ -669,6 +739,12 @@ mod tests {
             "google/gemini-3.8-flash-tts",
             Some("Kore"),
             1024,
+            AudioTransport {
+                format: AudioFormat::Pcm,
+                pcm_sample_rate: Some(24_000),
+                pcm_channels: Some(1),
+            },
+            |_| async { Ok(()) },
         )
         .await
         .unwrap();

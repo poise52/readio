@@ -19,14 +19,23 @@ const COVER_LIMIT: usize = 2 * 1024 * 1024;
 /// # Errors
 /// Returns an error for unreadable, oversized, unsupported, or malformed files.
 pub fn import_book(path: &Path) -> Result<Book> {
+    Ok(import_book_with_size(path, LIMIT)?.0)
+}
+
+pub fn import_book_with_size(path: &Path, remaining: u64) -> Result<(Book, u64)> {
+    let limit = LIMIT.min(remaining);
     let mut file = File::open(path)?;
-    if file.metadata()?.len() > LIMIT {
-        return Err(Error::Format("Книга больше 80 МБ".into()));
+    if file.metadata()?.len() > limit {
+        return Err(Error::Format(
+            "Книга превышает лимит размера импорта".into(),
+        ));
     }
     let mut bytes = Vec::new();
-    file.by_ref().take(LIMIT + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > LIMIT {
-        return Err(Error::Format("Книга больше 80 МБ".into()));
+    file.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(Error::Format(
+            "Книга превышает лимит размера импорта".into(),
+        ));
     }
     let title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Книга");
     let extension = path
@@ -40,11 +49,11 @@ pub fn import_book(path: &Path) -> Result<Book> {
             author: "Автор не указан".into(),
             chapters: vec![Chapter {
                 title: "Текст".into(),
-                text: clean(&decode(&bytes)),
+                text: clean(&decode(&bytes)?),
             }],
             ..Book::default()
         },
-        "fb2" => fb2(title, &decode(&bytes))?,
+        "fb2" => fb2(title, &decode(&bytes)?)?,
         "epub" => epub(title, &bytes)?,
         _ => return Err(Error::Format("Поддерживаются EPUB, FB2 и TXT".into())),
     };
@@ -53,13 +62,66 @@ pub fn import_book(path: &Path) -> Result<Book> {
     }
     book.id = Uuid::new_v4().to_string();
     book.refresh();
-    Ok(book)
+    Ok((book, bytes.len() as u64))
 }
-fn decode(bytes: &[u8]) -> String {
-    std::str::from_utf8(bytes).map_or_else(
-        |_| encoding_rs::WINDOWS_1251.decode(bytes).0.into_owned(),
-        |s| s.trim_start_matches('\u{feff}').to_owned(),
-    )
+fn decode(bytes: &[u8]) -> Result<String> {
+    let invalid = || Error::Format("Неизвестная или повреждённая кодировка текста".into());
+    if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
+        return encoding
+            .decode_without_bom_handling_and_without_replacement(&bytes[bom_len..])
+            .map(std::borrow::Cow::into_owned)
+            .ok_or_else(invalid);
+    }
+    let encoding = if bytes.starts_with(b"\0<\0?") {
+        Some(encoding_rs::UTF_16BE)
+    } else if bytes.starts_with(b"<\0?\0") {
+        Some(encoding_rs::UTF_16LE)
+    } else {
+        xml_encoding(bytes)?
+    };
+    if let Some(encoding) = encoding {
+        return encoding
+            .decode_without_bom_handling_and_without_replacement(bytes)
+            .map(std::borrow::Cow::into_owned)
+            .ok_or_else(invalid);
+    }
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| invalid())
+}
+
+fn xml_encoding(bytes: &[u8]) -> Result<Option<&'static encoding_rs::Encoding>> {
+    if !bytes.starts_with(b"<?xml") {
+        return Ok(None);
+    }
+    let prefix = &bytes[..bytes.len().min(1024)];
+    let end = prefix
+        .windows(2)
+        .position(|pair| pair == b"?>")
+        .ok_or_else(|| Error::Format("Некорректная XML-декларация".into()))?;
+    let declaration = std::str::from_utf8(&prefix[..end])
+        .map_err(|_| Error::Format("Некорректная XML-декларация".into()))?;
+    let Some(start) = declaration.find("encoding") else {
+        return Ok(None);
+    };
+    let rest = declaration[start + "encoding".len()..].trim_start();
+    let rest = rest
+        .strip_prefix('=')
+        .ok_or_else(|| Error::Format("Некорректная XML-кодировка".into()))?
+        .trim_start();
+    let quote = rest
+        .chars()
+        .next()
+        .filter(|ch| *ch == '\'' || *ch == '"')
+        .ok_or_else(|| Error::Format("Некорректная XML-кодировка".into()))?;
+    let label = rest[1..]
+        .split_once(quote)
+        .map(|(label, _)| label)
+        .ok_or_else(|| Error::Format("Некорректная XML-кодировка".into()))?;
+    Ok(Some(
+        encoding_rs::Encoding::for_label(label.as_bytes())
+            .ok_or_else(|| Error::Format("Неподдерживаемая XML-кодировка".into()))?,
+    ))
 }
 fn clean(text: &str) -> String {
     let mut out = String::new();
@@ -241,14 +303,14 @@ fn epub(fallback: &str, bytes: &[u8]) -> Result<Book> {
         &mut zip,
         "META-INF/container.xml",
         &mut remaining,
-    )?);
+    )?)?;
     let doc = Document::parse(&container).map_err(|e| Error::Format(e.to_string()))?;
     let opf_path = doc
         .descendants()
         .find(|n| n.has_tag_name("rootfile"))
         .and_then(|n| n.attribute("full-path"))
         .ok_or_else(|| Error::Format("Не найден EPUB package".into()))?;
-    let opf = decode(&zip_read(&mut zip, opf_path, &mut remaining)?);
+    let opf = decode(&zip_read(&mut zip, opf_path, &mut remaining)?)?;
     let doc = Document::parse(&opf).map_err(|e| Error::Format(e.to_string()))?;
     let root = doc.root_element();
     let base = opf_path.rsplit_once('/').map_or("", |(p, _)| p);
@@ -274,7 +336,7 @@ fn epub(fallback: &str, bytes: &[u8]) -> Result<Book> {
             continue;
         };
         let data = zip_read(&mut zip, &resolve(base, href)?, &mut remaining)?;
-        let html = Html::parse_document(&decode(&data));
+        let html = Html::parse_document(&decode(&data)?);
         let Some(body) = html.select(&body_selector).next() else {
             continue;
         };
@@ -436,7 +498,61 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn decodes_cp1251() {
-        assert_eq!(decode(&[0xcf, 0xf0, 0xe8, 0xe2, 0xe5, 0xf2]), "Привет");
+    fn decodes_cp1251() -> Result<()> {
+        let mut xml = b"<?xml version=\"1.0\" encoding=\"windows-1251\"?><x>".to_vec();
+        xml.extend_from_slice(&[0xcf, 0xf0, 0xe8, 0xe2, 0xe5, 0xf2]);
+        xml.extend_from_slice(b"</x>");
+        assert!(decode(&xml)?.contains("Привет"));
+        assert!(decode(&[0xcf, 0xf0, 0xe8, 0xe2, 0xe5, 0xf2]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn honors_utf_boms_and_rejects_unknown_declared_encoding() -> Result<()> {
+        let text = "Привет 😀";
+        let mut le = vec![0xff, 0xfe];
+        let mut be = vec![0xfe, 0xff];
+        for unit in text.encode_utf16() {
+            le.extend_from_slice(&unit.to_le_bytes());
+            be.extend_from_slice(&unit.to_be_bytes());
+        }
+        assert_eq!(decode(&le)?, text);
+        assert_eq!(decode(&be)?, text);
+        assert_eq!(decode(b"\xef\xbb\xbfhello")?, "hello");
+        assert!(decode(b"<?xml version='1.0' encoding='made-up'?><x/>").is_err());
+        assert!(decode(&[0xff, 0xfe, 0xff]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn imports_declared_cp1251_and_utf16_fb2_without_mojibake() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("readio-encoding-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let body = "<FictionBook><body><section><p>Привет, мир.</p></section></body></FictionBook>";
+        let cp_xml = format!("<?xml version=\"1.0\" encoding=\"windows-1251\"?>{body}");
+        let (cp, _, had_errors) = encoding_rs::WINDOWS_1251.encode(&cp_xml);
+        assert!(!had_errors);
+        let cp_path = dir.join("cp.fb2");
+        std::fs::write(&cp_path, cp.as_ref())?;
+        assert_eq!(import_book(&cp_path)?.chapters[0].text, "Привет, мир.");
+        let utf_xml = format!("<?xml version=\"1.0\" encoding=\"UTF-16\"?>{body}");
+        for (name, bom, little) in [
+            ("le.fb2", [0xff, 0xfe], true),
+            ("be.fb2", [0xfe, 0xff], false),
+        ] {
+            let mut bytes = bom.to_vec();
+            for unit in utf_xml.encode_utf16() {
+                bytes.extend_from_slice(&if little {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
+            let path = dir.join(name);
+            std::fs::write(&path, bytes)?;
+            assert_eq!(import_book(&path)?.chapters[0].text, "Привет, мир.");
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

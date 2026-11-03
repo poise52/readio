@@ -1,5 +1,7 @@
 mod openrouter;
-pub use openrouter::{OpenRouterModel, OpenRouterPricing};
+mod timing;
+pub use openrouter::{AudioFormat, AudioTransport, OpenRouterModel, OpenRouterPricing};
+pub use timing::{SpeechTiming, collect_edge_timings};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use msedge_tts::tts::{
@@ -7,9 +9,16 @@ use msedge_tts::tts::{
     stream::{SynthesizedResponse, tokio_runtime::msedge_tts_split_async},
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
+    io::Read,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Mutex,
@@ -93,6 +102,8 @@ pub struct SpeechAudio {
     pub data: String,
     pub mime: String,
     pub playback_rate: f32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub timings: Vec<SpeechTiming>,
 }
 
 #[derive(Debug)]
@@ -101,6 +112,49 @@ pub struct SpeechService {
     openrouter_client: reqwest::Client,
     generation: watch::Sender<u64>,
     generation_lock: Mutex<()>,
+    piper_revisions: Mutex<HashMap<String, (Vec<ResourceStamp>, String)>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResourceStamp {
+    path: PathBuf,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed: (i64, i64),
+    #[cfg(windows)]
+    windows_times: (u64, u64),
+    #[cfg(windows)]
+    windows_identity: (u64, u64),
+}
+
+fn resource_stamp(path: &Path) -> Result<ResourceStamp, SpeechError> {
+    let file = std::fs::File::open(path)
+        .map_err(|_| SpeechError::Engine("Не удалось открыть файлы Piper".into()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| SpeechError::Engine("Не удалось прочитать файлы Piper".into()))?;
+    #[cfg(windows)]
+    let identity = {
+        let info = winapi_util::file::information(&file)
+            .map_err(|_| SpeechError::Engine("Не удалось проверить файлы Piper".into()))?;
+        (info.volume_serial_number(), info.file_index())
+    };
+    Ok(ResourceStamp {
+        path: path.to_owned(),
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+        #[cfg(windows)]
+        windows_times: (metadata.creation_time(), metadata.last_write_time()),
+        #[cfg(windows)]
+        windows_identity: identity,
+    })
 }
 
 #[derive(Debug)]
@@ -108,6 +162,7 @@ struct PiperModel {
     id: String,
     path: PathBuf,
     name: String,
+    locale: String,
 }
 
 impl SpeechService {
@@ -122,6 +177,7 @@ impl SpeechService {
             openrouter_client: openrouter::client()?,
             generation,
             generation_lock: Mutex::new(()),
+            piper_revisions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -155,7 +211,7 @@ impl SpeechService {
             voices.extend(self.piper_models().into_iter().map(|model| Voice {
                 id: model.id,
                 name: format!("Piper {} · офлайн", model.name),
-                locale: "ru-RU".into(),
+                locale: model.locale,
                 engine: "piper".into(),
             }));
         }
@@ -172,7 +228,7 @@ impl SpeechService {
         voice: Option<&str>,
         speed: f32,
     ) -> Result<SpeechAudio, SpeechError> {
-        self.synthesize_inner(text, voice, speed, true).await
+        self.synthesize_inner(text, voice, speed).await
     }
 
     /// Synthesizes with the selected voice without switching engines.
@@ -185,7 +241,7 @@ impl SpeechService {
         voice: Option<&str>,
         speed: f32,
     ) -> Result<SpeechAudio, SpeechError> {
-        self.synthesize_inner(text, voice, speed, false).await
+        self.synthesize_inner(text, voice, speed).await
     }
 
     async fn synthesize_inner(
@@ -193,7 +249,6 @@ impl SpeechService {
         text: &str,
         voice: Option<&str>,
         speed: f32,
-        allow_fallback: bool,
     ) -> Result<SpeechAudio, SpeechError> {
         if text.trim().is_empty() || text.len() > MAX_TEXT_BYTES {
             return Err(SpeechError::InvalidText);
@@ -209,28 +264,9 @@ impl SpeechService {
         }
         let operation = async {
             if selected == EDGE_DMITRY || selected == EDGE_SVETLANA {
-                match edge(text, selected, speed).await {
-                    Ok(audio) => Ok((audio, "audio/mpeg")),
-                    Err(edge_error) => {
-                        if !allow_fallback {
-                            return Err(edge_error);
-                        }
-                        if let (Some(binary), Some(model)) =
-                            (self.piper_binary(), self.piper_models().into_iter().next())
-                        {
-                            piper(&binary, &model.path, text, speed)
-                                .await
-                                .map(|audio| (audio, "audio/wav"))
-                                .map_err(|offline| {
-                                    SpeechError::Engine(format!(
-                                        "Edge: {edge_error}; Piper: {offline}"
-                                    ))
-                                })
-                        } else {
-                            Err(edge_error)
-                        }
-                    }
-                }
+                edge(text, selected, speed)
+                    .await
+                    .map(|(audio, timings)| (audio, "audio/mpeg", timings))
             } else {
                 let model = self
                     .piper_models()
@@ -242,7 +278,7 @@ impl SpeechService {
                 })?;
                 piper(&binary, &model.path, text, speed)
                     .await
-                    .map(|audio| (audio, "audio/wav"))
+                    .map(|audio| (audio, "audio/wav", Vec::new()))
             }
         };
         let result = self.run_cancellable(Box::pin(operation)).await?;
@@ -255,6 +291,7 @@ impl SpeechService {
             data: STANDARD.encode(result.0),
             mime: result.1.into(),
             playback_rate: 1.0,
+            timings: result.2,
         })
     }
 
@@ -285,6 +322,18 @@ impl SpeechService {
         api_key: Option<&str>,
     ) -> Result<Vec<OpenRouterModel>, SpeechError> {
         openrouter::models(&self.openrouter_client, api_key).await
+    }
+
+    /// Fetches provider-reported USD cost for an existing generation.
+    ///
+    /// # Errors
+    /// Returns an error when credentials, response or provider usage are unavailable.
+    pub async fn openrouter_generation_cost(
+        &self,
+        api_key: &str,
+        generation_id: &str,
+    ) -> Result<String, SpeechError> {
+        openrouter::generation_cost(&self.openrouter_client, api_key, generation_id).await
     }
 
     /// Validates a speech request without contacting the provider.
@@ -321,9 +370,16 @@ impl SpeechService {
         voice: Option<&str>,
         speed: f32,
     ) -> Result<SpeechAudio, SpeechError> {
-        self.synthesize_openrouter(text, api_key, model, voice, speed, None, |_| async {
-            Ok(())
-        })
+        self.synthesize_openrouter(
+            text,
+            api_key,
+            model,
+            voice,
+            speed,
+            None,
+            AudioTransport::default(),
+            |_| async { Ok(()) },
+        )
         .await
     }
 
@@ -356,6 +412,35 @@ impl SpeechService {
             voice,
             speed,
             Some(generation),
+            AudioTransport::default(),
+            |_| async { Ok(()) },
+        )
+        .await
+    }
+
+    /// Synthesizes using explicitly selected output transport.
+    ///
+    /// # Errors
+    /// Returns an error for invalid transport, input, credentials or network failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn synthesize_with_openrouter_transport_if_current(
+        &self,
+        text: &str,
+        api_key: &str,
+        model: &str,
+        voice: Option<&str>,
+        speed: f32,
+        generation: u64,
+        transport: AudioTransport,
+    ) -> Result<SpeechAudio, SpeechError> {
+        self.synthesize_openrouter(
+            text,
+            api_key,
+            model,
+            voice,
+            speed,
+            Some(generation),
+            transport,
             |_| async { Ok(()) },
         )
         .await
@@ -374,6 +459,7 @@ impl SpeechService {
         voice: Option<&str>,
         speed: f32,
         generation: u64,
+        transport: AudioTransport,
         on_response: F,
     ) -> Result<SpeechAudio, SpeechError>
     where
@@ -387,6 +473,7 @@ impl SpeechService {
             voice,
             speed,
             Some(generation),
+            transport,
             on_response,
         )
         .await
@@ -401,6 +488,7 @@ impl SpeechService {
         voice: Option<&str>,
         speed: f32,
         generation: Option<u64>,
+        transport: AudioTransport,
         on_response: F,
     ) -> Result<SpeechAudio, SpeechError>
     where
@@ -416,6 +504,7 @@ impl SpeechService {
                     api_key,
                     model,
                     voice,
+                    transport,
                     on_response,
                 ),
                 generation,
@@ -425,6 +514,7 @@ impl SpeechService {
             data: STANDARD.encode(audio),
             mime: mime.into(),
             playback_rate: speed,
+            timings: Vec::new(),
         })
     }
 
@@ -497,6 +587,71 @@ impl SpeechService {
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models
     }
+
+    /// Hashes the selected Piper model, configuration and binary for cache identity.
+    ///
+    /// # Errors
+    /// Returns an error if the voice or one of its resources is unavailable.
+    pub fn piper_resource_revision(&self, voice: &str) -> Result<String, SpeechError> {
+        let model = self
+            .piper_models()
+            .into_iter()
+            .find(|model| model.id == voice)
+            .ok_or_else(|| SpeechError::UnknownVoice(voice.into()))?;
+        let binary = self
+            .piper_binary()
+            .ok_or_else(|| SpeechError::Engine("Piper не найден".into()))?;
+        let mut config: OsString = model.path.as_os_str().into();
+        config.push(".json");
+        let resources = [
+            (b"model".as_slice(), model.path.as_path()),
+            (b"config".as_slice(), Path::new(&config)),
+            (b"binary".as_slice(), binary.as_path()),
+        ];
+        let stamps = resources
+            .iter()
+            .map(|(_, path)| resource_stamp(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut revisions = self
+            .piper_revisions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, revision)) = revisions
+            .get(voice)
+            .filter(|(previous, _)| *previous == stamps)
+        {
+            return Ok(revision.clone());
+        }
+        let mut digest = Sha256::new();
+        for (kind, path) in resources {
+            digest.update(kind);
+            let mut file = std::fs::File::open(path)
+                .map_err(|_| SpeechError::Engine("Не удалось прочитать файлы Piper".into()))?;
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .map_err(|_| SpeechError::Engine("Не удалось прочитать файлы Piper".into()))?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+        }
+        let after = resources
+            .iter()
+            .map(|(_, path)| resource_stamp(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        if stamps != after {
+            return Err(SpeechError::Engine(
+                "Файлы Piper изменились во время чтения".into(),
+            ));
+        }
+        let revision = format!("{:x}", digest.finalize());
+        revisions.insert(voice.to_owned(), (stamps, revision.clone()));
+        drop(revisions);
+        Ok(revision)
+    }
 }
 
 fn is_file(path: &Path) -> bool {
@@ -533,12 +688,33 @@ fn collect_models(root: &Path, dir: &Path, depth: usize, models: &mut Vec<PiperM
             let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if !name.to_ascii_lowercase().starts_with("ru_ru-") {
+            let Ok(file) = std::fs::File::open(&config) else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            if file.take(1024 * 1024 + 1).read_to_end(&mut bytes).is_err() {
                 continue;
             }
+            if bytes.len() > 1024 * 1024 {
+                continue;
+            }
+            let Ok(config_value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let Some(locale) = config_value["language"]["code"]
+                .as_str()
+                .filter(|value| !value.is_empty() && value.len() <= 64)
+            else {
+                continue;
+            };
             let id = format!("piper:{}", relative.replace('\\', "/"));
             let name = name.to_owned();
-            models.push(PiperModel { id, path, name });
+            models.push(PiperModel {
+                id,
+                path,
+                name,
+                locale: locale.replace('_', "-"),
+            });
         }
     }
 }
@@ -566,14 +742,18 @@ enum EdgeFailure {
     AudioTooLarge,
 }
 
-async fn edge(text: &str, voice: &str, speed: f32) -> Result<Vec<u8>, SpeechError> {
+async fn edge(
+    text: &str,
+    voice: &str,
+    speed: f32,
+) -> Result<(Vec<u8>, Vec<SpeechTiming>), SpeechError> {
     retry_edge(|| edge_once(text, voice, speed)).await
 }
 
-async fn retry_edge<F, Fut>(mut attempt: F) -> Result<Vec<u8>, SpeechError>
+async fn retry_edge<F, Fut, T>(mut attempt: F) -> Result<T, SpeechError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>, EdgeFailure>>,
+    Fut: std::future::Future<Output = Result<T, EdgeFailure>>,
 {
     for index in 0..3 {
         let result = timeout(Duration::from_secs(45), attempt()).await;
@@ -601,7 +781,11 @@ where
 }
 
 #[allow(clippy::cast_possible_truncation)]
-async fn edge_once(text: &str, voice: &str, speed: f32) -> Result<Vec<u8>, EdgeFailure> {
+async fn edge_once(
+    text: &str,
+    voice: &str,
+    speed: f32,
+) -> Result<(Vec<u8>, Vec<SpeechTiming>), EdgeFailure> {
     let config = SpeechConfig {
         voice_name: voice.into(),
         audio_format: "audio-24khz-48kbitrate-mono-mp3".into(),
@@ -618,6 +802,8 @@ async fn edge_once(text: &str, voice: &str, speed: f32) -> Result<Vec<u8>, EdgeF
         .await
         .map_err(|_| EdgeFailure::Transient("Соединение с Edge прервалось при отправке текста."))?;
     let mut audio = Vec::new();
+    let mut metadata = Vec::new();
+    let mut metadata_overflow = false;
     loop {
         let chunk = timeout(Duration::from_secs(15), receiver.read())
             .await
@@ -625,11 +811,22 @@ async fn edge_once(text: &str, voice: &str, speed: f32) -> Result<Vec<u8>, EdgeF
             .map_err(|_| {
                 EdgeFailure::Transient("Соединение с Edge прервалось во время синтеза.")
             })?;
-        if let Some(SynthesizedResponse::AudioBytes(bytes)) = chunk {
-            if audio.len().saturating_add(bytes.len()) > MAX_AUDIO_BYTES {
-                return Err(EdgeFailure::AudioTooLarge);
+        match chunk {
+            Some(SynthesizedResponse::AudioBytes(bytes)) => {
+                if audio.len().saturating_add(bytes.len()) > MAX_AUDIO_BYTES {
+                    return Err(EdgeFailure::AudioTooLarge);
+                }
+                audio.extend_from_slice(&bytes);
             }
-            audio.extend_from_slice(&bytes);
+            Some(SynthesizedResponse::AudioMetadata(items)) => {
+                if metadata.len().saturating_add(items.len()) > 4096 {
+                    metadata.clear();
+                    metadata_overflow = true;
+                } else if !metadata_overflow {
+                    metadata.extend(items);
+                }
+            }
+            _ => {}
         }
         if !receiver.can_read().await {
             break;
@@ -639,7 +836,10 @@ async fn edge_once(text: &str, voice: &str, speed: f32) -> Result<Vec<u8>, EdgeF
     if audio.is_empty() {
         return Err(EdgeFailure::Transient("Edge вернул пустое аудио."));
     }
-    Ok(audio)
+    Ok((
+        audio,
+        collect_edge_timings(text, &metadata).unwrap_or_default(),
+    ))
 }
 
 async fn piper(
@@ -674,6 +874,11 @@ async fn piper(
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
+    let audio = piper_exchange(command, text).await?;
+    pcm_to_wav(&audio, sample_rate)
+}
+
+async fn piper_exchange(mut command: Command, text: &str) -> Result<Vec<u8>, SpeechError> {
     let mut child = command
         .spawn()
         .map_err(|error| SpeechError::Engine(format!("не удалось запустить Piper: {error}")))?;
@@ -686,9 +891,10 @@ async fn piper(
         .take()
         .ok_or_else(|| SpeechError::Engine("Piper не открыл stdout".into()))?;
     let single_line = text.replace(['\r', '\n'], " ");
-    let write_input = async {
+    let write_input = async move {
         stdin.write_all(single_line.as_bytes()).await?;
-        stdin.shutdown().await
+        drop(stdin);
+        Ok::<(), std::io::Error>(())
     };
     let read_audio = async {
         let mut audio = Vec::new();
@@ -717,7 +923,7 @@ async fn piper(
             "Piper не создал PCM (код: {status})"
         )));
     }
-    pcm_to_wav(&audio, sample_rate)
+    Ok(audio)
 }
 
 fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Result<Vec<u8>, SpeechError> {
@@ -744,6 +950,84 @@ fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Result<Vec<u8>, SpeechError> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    const PIPER_EOF_CHILD: &str = "READIO_TEST_PIPER_EOF_CHILD";
+    const PIPER_EOF_PCM: &[u8] = b"\x01\x02\x03\x04";
+
+    #[test]
+    fn piper_eof_child() {
+        use std::io::Write as _;
+        if std::env::var_os(PIPER_EOF_CHILD).is_none() {
+            return;
+        }
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input).unwrap();
+        if input != "Привет Мир".as_bytes() {
+            std::process::exit(2);
+        }
+        std::io::stdout().write_all(PIPER_EOF_PCM).unwrap();
+        std::io::stdout().flush().unwrap();
+        std::process::exit(0);
+    }
+
+    #[tokio::test]
+    async fn piper_closes_stdin_after_writing_to_allow_eof() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::piper_eof_child", "--nocapture"])
+            .env(PIPER_EOF_CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let audio = timeout(
+            Duration::from_secs(3),
+            piper_exchange(command, "Привет\nМир"),
+        )
+        .await
+        .expect("Piper did not receive EOF")
+        .unwrap();
+        assert!(audio.ends_with(PIPER_EOF_PCM));
+    }
+
+    #[test]
+    fn discovers_piper_config_locale_and_detects_resource_replacement() {
+        let root =
+            std::env::temp_dir().join(format!("readio-piper-resources-{}", std::process::id()));
+        let models = root.join("models/piper");
+        let binary_dir = root.join("piper");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::create_dir_all(&binary_dir).unwrap();
+        let name = if cfg!(windows) { "piper.exe" } else { "piper" };
+        std::fs::write(binary_dir.join(name), b"binary").unwrap();
+        let model = models.join("arbitrary.onnx");
+        std::fs::write(&model, b"model-a").unwrap();
+        std::fs::write(
+            models.join("arbitrary.onnx.json"),
+            br#"{"language":{"code":"en_US"},"audio":{"sample_rate":22050}}"#,
+        )
+        .unwrap();
+        let discovered = {
+            let mut entries = Vec::new();
+            collect_models(&models, &models, 0, &mut entries);
+            entries
+        };
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].locale, "en-US");
+        if std::env::var_os("READIO_PIPER_BIN").is_none()
+            && std::env::var_os("READIO_PIPER_MODELS").is_none()
+        {
+            let service = SpeechService::new(root.clone()).unwrap();
+            let before = service
+                .piper_resource_revision("piper:arbitrary.onnx")
+                .unwrap();
+            std::fs::write(&model, b"model-b-changed").unwrap();
+            let after = service
+                .piper_resource_revision("piper:arbitrary.onnx")
+                .unwrap();
+            assert_ne!(before, after);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn escapes_xml_and_removes_invalid_controls() {
         assert_eq!(
@@ -986,7 +1270,7 @@ mod tests {
         let mut attempts = 0;
         let result = retry_edge(|| {
             attempts += 1;
-            std::future::ready(Err(EdgeFailure::AudioTooLarge))
+            std::future::ready(Err::<Vec<u8>, _>(EdgeFailure::AudioTooLarge))
         })
         .await;
         assert!(matches!(result, Err(SpeechError::Engine(_))));
@@ -1024,7 +1308,7 @@ mod tests {
         ] {
             let audio = edge(text, EDGE_DMITRY, 1.0).await.expect("Edge synthesis");
             assert!(
-                audio.len() > 1000,
+                audio.0.len() > 1000,
                 "Edge returned too little audio for {text}"
             );
         }

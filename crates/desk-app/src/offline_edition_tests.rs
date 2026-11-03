@@ -75,6 +75,7 @@ fn openrouter_profile() -> AudioProfile {
         model_voice: None,
         dictionary: BTreeMap::new(),
         max_escaped_bytes: Some(100),
+        synthesis: None,
     }
 }
 
@@ -280,10 +281,11 @@ async fn saved_edition_and_worker_keep_snapshot_boundaries_and_remove_does_not_r
     manager.jobs.lock().await.insert(
         source.id.clone(),
         Job {
-            state: "running",
+            state: OfflineJobState::Running,
             error: None,
             generation: 1,
             engine: profile.engine.clone(),
+            budget: None,
         },
     );
     let allowed = saved_ids.iter().cloned().collect::<HashSet<_>>();
@@ -304,7 +306,7 @@ async fn saved_edition_and_worker_keep_snapshot_boundaries_and_remove_does_not_r
     assert_eq!(actual, allowed);
     assert_eq!(
         manager.jobs.lock().await.get(&source.id).unwrap().state,
-        "complete"
+        OfflineJobState::Complete
     );
     assert_eq!(manager.chapter_builds.load(Ordering::SeqCst), 0);
     let _ = manager.saved_edition(source.id.clone()).await?;

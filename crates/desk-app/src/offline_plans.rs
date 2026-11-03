@@ -1,6 +1,6 @@
 use super::{IpcResult, OfflineManager};
+use desk_core::ChapterPlanner;
 use desk_core::{AudioBlock, AudioProfile, Book, EditionPlan, OfflineManifest};
-use desk_core::{ChapterPlanner, plan_chapter_v1};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::{collections::HashMap, sync::Arc};
@@ -81,28 +81,33 @@ impl OfflineManager {
         book_id: String,
         chapter: usize,
     ) -> IpcResult<(AudioProfile, Arc<ChapterPlan>)> {
-        let _singleflight = self.plan_gate.lock().await;
+        let _singleflight = Arc::clone(&self.plan_gate).lock_owned().await;
         let store = Arc::clone(&self.store);
         let plans = Arc::clone(&self.chapter_plans);
         let planners = Arc::clone(&self.planner);
+        let speech = Arc::clone(&self.speech);
         #[cfg(test)]
         let builds = Arc::clone(&self.chapter_builds);
         let (profile, result, epoch) =
             tauri::async_runtime::spawn_blocking(move || -> IpcResult<_> {
                 let (profile, key, epoch, source) = {
-                    let store = store.lock().map_err(|e| e.to_string())?;
-                    let profile = AudioProfile::from_preferences(
-                        &store.preferences().map_err(|e| e.to_string())?,
-                    );
+                    let preferences = store
+                        .lock()
+                        .map_err(|e| e.to_string())?
+                        .preferences()
+                        .map_err(|e| e.to_string())?;
+                    let mut profile = AudioProfile::from_preferences(&preferences);
+                    Self::resolve_resource_revision(&speech, &mut profile)?;
                     let key = format!("{}:{book_id}:{chapter}:{}", book_id.len(), profile.id());
                     let epoch = plans.epoch();
                     if let Some(cached) = plans.get(&key) {
                         return Ok((profile, cached, epoch));
                     }
                     let source = store
+                        .lock()
+                        .map_err(|e| e.to_string())?
                         .chapter(&book_id, chapter)
                         .map_err(|e| e.to_string())?;
-                    drop(store);
                     (profile, key, epoch, source)
                 };
                 let planner = {
@@ -112,13 +117,20 @@ impl OfflineManager {
                         .as_ref()
                         .is_none_or(|(current_id, _)| *current_id != id)
                     {
-                        *current = Some((id, Arc::new(ChapterPlanner::new(&profile))));
+                        *current = Some((
+                            id,
+                            Arc::new(ChapterPlanner::try_new(&profile).map_err(|e| e.to_string())?),
+                        ));
                     }
                     let result = Arc::clone(&current.as_ref().ok_or("Планировщик недоступен")?.1);
                     drop(current);
                     result
                 };
-                let result = Arc::new(ChapterPlan::new(planner.plan_chapter(chapter, &source)));
+                let result = Arc::new(ChapterPlan::new(
+                    planner
+                        .try_plan_chapter(chapter, &source)
+                        .map_err(|e| e.to_string())?,
+                ));
                 #[cfg(test)]
                 builds.fetch_add(1, Ordering::SeqCst);
                 let bytes = result.bytes();
@@ -173,13 +185,16 @@ impl OfflineManager {
         &self,
         manifest: OfflineManifest,
     ) -> IpcResult<(OfflineManifest, Arc<EditionPlan>)> {
-        let _singleflight = self.plan_gate.lock().await;
+        let singleflight = Arc::clone(&self.plan_gate).lock_owned().await;
+        let permit = self.mutation_permit()?;
         let store = Arc::clone(&self.store);
         let cache = Arc::clone(&self.cache);
         let plans = Arc::clone(&self.edition_plans);
         let manifests = Arc::clone(&self.manifest_plans);
         let (manifest, plan, epoch) =
             tauri::async_runtime::spawn_blocking(move || -> IpcResult<_> {
+                let _singleflight = singleflight;
+                let _permit = permit;
                 let epoch = {
                     let store = store.lock().map_err(|e| e.to_string())?;
                     let epoch = plans.epoch();
@@ -209,13 +224,9 @@ impl OfflineManager {
                 let plan = if let Some(digest) = &manifest.plan_digest {
                     cache.edition_plan(digest).map_err(|e| e.to_string())?
                 } else {
-                    let plan = EditionPlan::migrate_legacy(
-                        &book,
-                        &manifest.profile,
-                        &manifest.block_ids,
-                        plan_chapter_v1,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    let plan =
+                        EditionPlan::migrate_legacy(&book, &manifest.profile, &manifest.block_ids)
+                            .map_err(|e| e.to_string())?;
                     let _store = store.lock().map_err(|e| e.to_string())?;
                     if plans.epoch() != epoch {
                         return Err("Книга изменилась во время миграции".into());
