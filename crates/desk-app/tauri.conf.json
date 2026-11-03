@@ -26,7 +26,7 @@
           "$APPDATA/**"
         ]
       },
-      "csp": "default-src 'self' asset: http://asset.localhost; img-src 'self' asset: http://asset.localhost data:; media-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws://localhost:3000 ws://127.0.0.1:3000"
+      "csp": "default-src 'self' asset: http://asset.localhost; img-src 'self' asset: http://asset.localhost data:; media-src 'self' blob: data: readio-audio: http://readio-audio.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws://localhost:3000 ws://127.0.0.1:3000"
     }
   },
   "bundle": {

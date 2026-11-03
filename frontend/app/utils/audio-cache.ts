@@ -34,6 +34,7 @@ export class AudioBlockLoader {
     context?: PlaybackRequest,
   ) => Promise<SpeechAudio>;
   private capacity: number;
+  private readonly dispose: (audio: SpeechAudio) => void;
   constructor(
     fetchBlock: (
       key: string,
@@ -41,9 +42,11 @@ export class AudioBlockLoader {
       context?: PlaybackRequest,
     ) => Promise<SpeechAudio>,
     capacity = 3,
+    dispose: (audio: SpeechAudio) => void = () => {},
   ) {
     this.fetchBlock = fetchBlock;
     this.capacity = capacity;
+    this.dispose = dispose;
   }
   get(
     key: string,
@@ -57,7 +60,13 @@ export class AudioBlockLoader {
       return Promise.resolve(cached);
     }
     const inFlight = this.pending.get(key);
-    if (inFlight) return inFlight;
+    if (inFlight) {
+      if (this.invalidated.has(key))
+        return inFlight
+          .catch(() => {})
+          .then(() => this.get(key, retry, context));
+      return inFlight;
+    }
     if (this.failed.has(key)) {
       const failure = this.failed.get(key);
       if (
@@ -71,8 +80,11 @@ export class AudioBlockLoader {
     this.invalidated.delete(key);
     const request = this.fetchBlock(key, retry, context)
       .then((audio) => {
-        if (this.invalidated.delete(key)) return audio;
-        const size = audio.data.length * 2;
+        if (this.invalidated.delete(key)) {
+          this.dispose(audio);
+          return audio;
+        }
+        const size = (audio.data?.length ?? 0) * 2;
         if (size <= this.maxReadyBytes && this.capacity > 0) {
           this.ready.set(key, audio);
           this.readyBytes += size;
@@ -81,8 +93,10 @@ export class AudioBlockLoader {
             this.readyBytes > this.maxReadyBytes
           ) {
             const oldest = this.ready.keys().next().value!;
-            this.readyBytes -= this.ready.get(oldest)!.data.length * 2;
+            const evicted = this.ready.get(oldest)!;
+            this.readyBytes -= (evicted.data?.length ?? 0) * 2;
             this.ready.delete(oldest);
+            this.dispose(evicted);
           }
         }
         return audio;
@@ -115,14 +129,22 @@ export class AudioBlockLoader {
     };
     for (const [key, audio] of this.ready) {
       if (belongs(key)) {
-        this.readyBytes -= audio.data.length * 2;
+        this.readyBytes -= (audio.data?.length ?? 0) * 2;
         this.ready.delete(key);
+        this.dispose(audio);
       }
     }
     for (const key of this.failed.keys())
       if (belongs(key)) this.failed.delete(key);
     for (const key of this.pending.keys())
       if (belongs(key)) this.invalidated.add(key);
+  }
+  takeResource(key: string, expected?: SpeechAudio): void {
+    const audio = this.ready.get(key);
+    if (audio?.resourceId && (!expected || audio === expected)) {
+      this.ready.delete(key);
+      this.readyBytes -= (audio.data?.length ?? 0) * 2;
+    }
   }
   async settle(): Promise<void> {
     await Promise.allSettled([...this.pending.values()]);

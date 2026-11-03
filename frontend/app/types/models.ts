@@ -1,3 +1,5 @@
+import type { OfflineJobState } from "./ipc";
+
 export interface BookSummary {
   id: string;
   title: string;
@@ -23,10 +25,31 @@ export interface Passage {
   end: number;
   text: string;
 }
+export interface AudioPosition {
+  chapter: number;
+  blockId: string;
+  profileId: string;
+  seconds: number;
+}
 export interface Book extends BookSummary {
+  audioPosition: AudioPosition | null;
   chapters: Chapter[];
   marks: Mark[];
   passages: Passage[];
+}
+export interface ModelSettings {
+  resourceRevision?: string | null;
+  transport?: {
+    format: "mp3" | "pcm";
+    pcmSampleRate?: number | null;
+    pcmChannels?: number | null;
+  } | null;
+  inputLimit?: {
+    unit: "character" | "utf8_byte" | "xml_escaped_byte";
+    value: number;
+    source: "user" | "provider";
+    verifiedAt?: number | null;
+  } | null;
 }
 export interface Preferences {
   dark: boolean;
@@ -41,6 +64,7 @@ export interface Preferences {
   surfaceTransparency: number;
   voice: string | null;
   openRouterModel: string | null;
+  openRouterModelSettings: Record<string, ModelSettings>;
   openRouterBillingUnits: Record<string, "character" | "utf8_byte">;
   openRouterVoice: string | null;
   volume: number;
@@ -54,6 +78,7 @@ export interface Voice {
 }
 export interface OpenRouterModel {
   id: string;
+  canonicalSlug: string | null;
   name: string;
   description: string;
   pricing: { prompt: string; completion: string };
@@ -70,12 +95,22 @@ export interface Bootstrap {
   warnings: string[];
   openRouter: OpenRouterStatus;
 }
+export interface SpeechTiming {
+  startUtf16: number;
+  endUtf16: number;
+  startSeconds: number;
+  endSeconds: number;
+}
 export interface SpeechAudio {
-  data: string;
+  timings?: SpeechTiming[] | null;
+  data?: string;
+  resourceId?: string;
   mime: string;
   playbackRate?: number;
 }
 export interface AudioPart {
+  synthesisStart?: number | null;
+  synthesisEnd?: number | null;
   index: number;
   start: number;
   end: number;
@@ -98,9 +133,14 @@ export interface AudioPlan {
 export interface OfflineStatus {
   bookId: string;
   profileId: string | null;
-  state: "none" | "paused" | "running" | "complete" | "error";
+  state: OfflineJobState;
   totalBlocks: number;
   cachedBlocks: number;
+  pendingRequests: number;
+  submittedRequests: number;
+  unknownCostRequests: number;
+  actualCostUsd: string | null;
+  estimatedReservedUsd: string | null;
   bytes: number;
   error: string | null;
 }
@@ -119,6 +159,8 @@ export interface OfflineQuote {
   maxPassages: number;
   limitSource: "app";
   pricing: { prompt: string; completion: string } | null;
+  pricingSource: "openrouter_api" | null;
+  pricingVerifiedAt: number | null;
   estimatedCost: string | null;
   costReason:
     | "providerunitunavailable"

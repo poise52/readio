@@ -85,24 +85,29 @@ impl OfflineManager {
         let store = Arc::clone(&self.store);
         let plans = Arc::clone(&self.chapter_plans);
         let planners = Arc::clone(&self.planner);
+        let speech = Arc::clone(&self.speech);
         #[cfg(test)]
         let builds = Arc::clone(&self.chapter_builds);
         let (profile, result, epoch) =
             tauri::async_runtime::spawn_blocking(move || -> IpcResult<_> {
                 let (profile, key, epoch, source) = {
-                    let store = store.lock().map_err(|e| e.to_string())?;
-                    let profile = AudioProfile::from_preferences(
-                        &store.preferences().map_err(|e| e.to_string())?,
-                    );
+                    let preferences = store
+                        .lock()
+                        .map_err(|e| e.to_string())?
+                        .preferences()
+                        .map_err(|e| e.to_string())?;
+                    let mut profile = AudioProfile::from_preferences(&preferences);
+                    Self::resolve_resource_revision(&speech, &mut profile)?;
                     let key = format!("{}:{book_id}:{chapter}:{}", book_id.len(), profile.id());
                     let epoch = plans.epoch();
                     if let Some(cached) = plans.get(&key) {
                         return Ok((profile, cached, epoch));
                     }
                     let source = store
+                        .lock()
+                        .map_err(|e| e.to_string())?
                         .chapter(&book_id, chapter)
                         .map_err(|e| e.to_string())?;
-                    drop(store);
                     (profile, key, epoch, source)
                 };
                 let planner = {
@@ -112,13 +117,20 @@ impl OfflineManager {
                         .as_ref()
                         .is_none_or(|(current_id, _)| *current_id != id)
                     {
-                        *current = Some((id, Arc::new(ChapterPlanner::new(&profile))));
+                        *current = Some((
+                            id,
+                            Arc::new(ChapterPlanner::try_new(&profile).map_err(|e| e.to_string())?),
+                        ));
                     }
                     let result = Arc::clone(&current.as_ref().ok_or("Планировщик недоступен")?.1);
                     drop(current);
                     result
                 };
-                let result = Arc::new(ChapterPlan::new(planner.plan_chapter(chapter, &source)));
+                let result = Arc::new(ChapterPlan::new(
+                    planner
+                        .try_plan_chapter(chapter, &source)
+                        .map_err(|e| e.to_string())?,
+                ));
                 #[cfg(test)]
                 builds.fetch_add(1, Ordering::SeqCst);
                 let bytes = result.bytes();

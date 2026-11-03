@@ -31,15 +31,6 @@ pub struct EditionPlan {
     block_index: OnceLock<Vec<HashMap<String, usize>>>,
 }
 
-fn hash_parts(parts: &[&[u8]]) -> String {
-    let mut digest = Sha256::new();
-    for part in parts {
-        digest.update((part.len() as u64).to_be_bytes());
-        digest.update(part);
-    }
-    format!("{:x}", digest.finalize())
-}
-
 fn source_fingerprint(book: &Book) -> String {
     let mut hash = Sha256::new();
     let add = |hash: &mut Sha256, bytes: &[u8]| {
@@ -55,14 +46,7 @@ fn source_fingerprint(book: &Book) -> String {
 }
 
 fn block_id(block: &AudioBlock, profile: &AudioProfile) -> String {
-    hash_parts(&[
-        b"readio-audio-block-v1",
-        profile.engine.as_bytes(),
-        profile.voice.as_bytes(),
-        profile.model.as_deref().unwrap_or("").as_bytes(),
-        profile.model_voice.as_deref().unwrap_or("").as_bytes(),
-        block.text.as_bytes(),
-    ])
+    crate::audio::canonical_block_id(&block.text, profile)
 }
 
 fn invalid() -> Error {
@@ -75,16 +59,16 @@ impl EditionPlan {
     /// # Errors
     /// Returns an error when the generated plan is invalid or exceeds the application limit.
     pub fn build(book: &Book, profile: &AudioProfile) -> Result<Self> {
-        let planner = ChapterPlanner::new(profile);
+        let planner = ChapterPlanner::try_new(profile)?;
         Self::with_planner(book, profile, |book, index, _| {
-            planner.plan_chapter(index, &book.chapters[index])
+            planner.try_plan_chapter(index, &book.chapters[index])
         })
     }
 
     fn with_planner(
         book: &Book,
         profile: &AudioProfile,
-        planner: impl Fn(&Book, usize, &AudioProfile) -> Vec<AudioBlock>,
+        planner: impl Fn(&Book, usize, &AudioProfile) -> Result<Vec<AudioBlock>>,
     ) -> Result<Self> {
         let plan = Self {
             version: EDITION_PLAN_VERSION,
@@ -96,12 +80,14 @@ impl EditionPlan {
                 .chapters
                 .iter()
                 .enumerate()
-                .map(|(index, chapter)| EditionChapter {
-                    title: chapter.title.clone(),
-                    source_utf16_len: chapter.text.encode_utf16().count(),
-                    blocks: planner(book, index, profile),
+                .map(|(index, chapter)| {
+                    Ok(EditionChapter {
+                        title: chapter.title.clone(),
+                        source_utf16_len: chapter.text.encode_utf16().count(),
+                        blocks: planner(book, index, profile)?,
+                    })
                 })
-                .collect(),
+                .collect::<Result<_>>()?,
         };
         plan.validate(book, profile)?;
         plan.encode()?;
@@ -118,7 +104,13 @@ impl EditionPlan {
         saved_ids: &[String],
         frozen_planner: impl Fn(&Book, usize, &AudioProfile) -> Vec<AudioBlock>,
     ) -> Result<Self> {
-        let plan = Self::with_planner(book, profile, frozen_planner)?;
+        let bounded = ChapterPlanner::try_new(profile)?;
+        for chapter in &book.chapters {
+            bounded.validate_legacy_source(&chapter.text)?;
+        }
+        let plan = Self::with_planner(book, profile, |book, chapter, profile| {
+            Ok(frozen_planner(book, chapter, profile))
+        })?;
         if !plan.block_ids().iter().eq(saved_ids.iter()) {
             return Err(Error::Format(
                 "План старого издания не совпадает с сохранёнными аудиоблоками".into(),
@@ -177,6 +169,13 @@ impl EditionPlan {
                 }
                 let mut previous_part_start = block.start;
                 let mut previous_part_index = 0;
+                let mut previous_synthesis_end = 0;
+                let mut synthesis_boundaries = HashSet::from([0]);
+                let mut synthesis_offset = 0;
+                for ch in block.text.chars() {
+                    synthesis_offset += ch.len_utf16();
+                    synthesis_boundaries.insert(synthesis_offset);
+                }
                 for part in &block.passages {
                     let passage_index_invalid = part.index >= saved.source_utf16_len;
                     if part.start < block.start
@@ -188,6 +187,18 @@ impl EditionPlan {
                         || part.index < previous_part_index
                     {
                         return Err(invalid());
+                    }
+                    match (part.synthesis_start, part.synthesis_end) {
+                        (None, None) => (),
+                        (Some(start), Some(end))
+                            if start >= previous_synthesis_end
+                                && start < end
+                                && synthesis_boundaries.contains(&start)
+                                && synthesis_boundaries.contains(&end) =>
+                        {
+                            previous_synthesis_end = end;
+                        }
+                        _ => return Err(invalid()),
                     }
                     previous_part_start = part.start;
                     previous_part_index = part.index;

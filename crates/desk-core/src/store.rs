@@ -1,6 +1,6 @@
 use crate::{
-    Book, BookSummary, Chapter, ChapterSummary, Error, Mark, Preferences, ReaderBook, Result,
-    import_book, split_passages,
+    AudioPosition, Book, BookSummary, Chapter, ChapterSummary, Error, Mark, Preferences,
+    ReaderBook, Result, split_passages,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::{
@@ -9,10 +9,45 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Application-wide memory/work budget for one import batch, not a provider limit.
+pub const MAX_IMPORT_BATCH_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_IMPORT_BATCH_BOOKS: usize = 256;
+
+fn book_size(book: &Book) -> u64 {
+    let mut size = book
+        .title
+        .len()
+        .saturating_add(book.author.len())
+        .saturating_add(book.cover.as_ref().map_or(0, String::len));
+    for chapter in &book.chapters {
+        size = size
+            .saturating_add(chapter.title.len())
+            .saturating_add(chapter.text.len());
+    }
+    for mark in &book.marks {
+        size = size.saturating_add(mark.excerpt.len());
+    }
+    u64::try_from(size).unwrap_or(u64::MAX)
+}
+
+fn charge_import(used: &mut u64, amount: u64) -> Result<()> {
+    *used = used
+        .checked_add(amount)
+        .filter(|size| *size <= MAX_IMPORT_BATCH_BYTES)
+        .ok_or_else(|| Error::Format("Превышен общий лимит размера импорта".into()))?;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
     root: PathBuf,
+}
+fn valid_audio_position_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 impl Store {
     /// # Errors
@@ -24,6 +59,7 @@ impl Store {
           CREATE TABLE IF NOT EXISTS books (id TEXT PRIMARY KEY,title TEXT NOT NULL,author TEXT NOT NULL,cover TEXT,chapter INTEGER NOT NULL,offset INTEGER NOT NULL,speed REAL NOT NULL,total INTEGER NOT NULL,done INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS chapters (book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,idx INTEGER NOT NULL,title TEXT NOT NULL,text TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(book_id,idx));
           CREATE TABLE IF NOT EXISTS marks (id TEXT PRIMARY KEY,book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,chapter INTEGER NOT NULL,offset INTEGER NOT NULL,excerpt TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS audio_positions (book_id TEXT PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,data TEXT NOT NULL);")?;
         Ok(Self {
             conn,
@@ -173,6 +209,7 @@ impl Store {
             })?
             .collect::<std::result::Result<_, _>>()?;
         book.refresh();
+        book.audio_position = self.audio_position(id)?;
         Ok(book)
     }
     /// Reads reader metadata and the current chapter without loading other chapter texts.
@@ -195,6 +232,7 @@ impl Store {
                         chapter: r.get(4)?,
                         offset: r.get(5)?,
                         speed: r.get(6)?,
+                        audio_position: None,
                         marks: Vec::new(),
                         passages: Vec::new(),
                         progress: 0.0,
@@ -247,7 +285,22 @@ impl Store {
             f64::from(u32::try_from(done + book.offset).unwrap_or(u32::MAX))
                 / f64::from(u32::try_from(total).unwrap_or(u32::MAX))
         };
+        book.audio_position = self.audio_position(id)?;
         Ok(book)
+    }
+
+    fn audio_position(&self, id: &str) -> Result<Option<AudioPosition>> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM audio_positions WHERE book_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|data| serde_json::from_str(&data).map_err(Into::into))
+            .transpose()
     }
     /// Reads one chapter and distinguishes a missing book from a missing chapter.
     ///
@@ -267,15 +320,40 @@ impl Store {
     /// # Errors
     /// Returns an error if a book cannot be parsed or stored.
     pub fn import(&self, paths: &[String]) -> Result<Vec<BookSummary>> {
-        let books: Vec<_> = paths
-            .iter()
-            .map(|p| import_book(Path::new(p)))
-            .collect::<Result<_>>()?;
-        self.import_parsed(&books)
+        if paths.len() > MAX_IMPORT_BATCH_BOOKS {
+            return Err(Error::Format("Слишком много книг в одном импорте".into()));
+        }
+        let mut input = 0;
+        for path in paths {
+            charge_import(&mut input, fs::metadata(path)?.len())?;
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut decoded = 0;
+        let mut actual_input = 0;
+        let mut summaries = Vec::with_capacity(paths.len());
+        for path in paths {
+            let (book, bytes) = crate::importer::import_book_with_size(
+                Path::new(path),
+                MAX_IMPORT_BATCH_BYTES - actual_input,
+            )?;
+            charge_import(&mut actual_input, bytes)?;
+            charge_import(&mut decoded, book_size(&book))?;
+            Self::insert(&tx, &book)?;
+            summaries.push(book.summary());
+        }
+        tx.commit()?;
+        Ok(summaries)
     }
     /// # Errors
     /// Returns an error if the database transaction fails.
     pub fn import_parsed(&self, books: &[Book]) -> Result<Vec<BookSummary>> {
+        if books.len() > MAX_IMPORT_BATCH_BOOKS {
+            return Err(Error::Format("Слишком много книг в одном импорте".into()));
+        }
+        let mut size = 0;
+        for book in books {
+            charge_import(&mut size, book_size(book))?;
+        }
         let tx = self.conn.unchecked_transaction()?;
         for book in books {
             Self::insert(&tx, book)?;
@@ -300,11 +378,35 @@ impl Store {
         offset: usize,
         speed: f32,
     ) -> Result<BookSummary> {
+        self.position_with_audio(id, chapter, offset, speed, None)
+    }
+
+    /// Atomically persists text and optional exact audio playback position.
+    ///
+    /// # Errors
+    /// Returns an error when either position is invalid or cannot be stored.
+    pub fn position_with_audio(
+        &self,
+        id: &str,
+        chapter: usize,
+        offset: usize,
+        speed: f32,
+        audio_position: Option<&AudioPosition>,
+    ) -> Result<BookSummary> {
         if !speed.is_finite() || !(0.25..=4.0).contains(&speed) {
             return Err(Error::Format("Недопустимая скорость".into()));
         }
-        let length: usize = self
-            .conn
+        if audio_position.is_some_and(|position| {
+            position.chapter != chapter
+                || !position.seconds.is_finite()
+                || position.seconds < 0.0
+                || !valid_audio_position_id(&position.block_id)
+                || !valid_audio_position_id(&position.profile_id)
+        }) {
+            return Err(Error::Format("Некорректная позиция аудио".into()));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let length: usize = tx
             .query_row(
                 "SELECT length FROM chapters WHERE book_id=?1 AND idx=?2",
                 params![id, chapter],
@@ -312,12 +414,12 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| Error::Format("Глава не найдена".into()))?;
-        let done: usize = self.conn.query_row(
+        let done: usize = tx.query_row(
             "SELECT COALESCE(SUM(length),0) FROM chapters WHERE book_id=?1 AND idx<?2",
             params![id, chapter],
             |r| r.get(0),
         )?;
-        self.conn.execute(
+        tx.execute(
             "UPDATE books SET chapter=?2,offset=?3,speed=?4,done=?5 WHERE id=?1",
             params![
                 id,
@@ -327,7 +429,14 @@ impl Store {
                 done + offset.min(length)
             ],
         )?;
-        self.conn.query_row("SELECT id,title,author,cover,chapter,offset,speed,CASE WHEN total=0 THEN 0.0 ELSE 1.0*done/total END FROM books WHERE id=?1", [id], |r| Ok(BookSummary { id:r.get(0)?,title:r.get(1)?,author:r.get(2)?,cover:r.get(3)?,chapter:r.get(4)?,offset:r.get(5)?,speed:r.get(6)?,progress:r.get(7)? })).optional()?.ok_or(Error::NotFound)
+        if let Some(position) = audio_position {
+            tx.execute("INSERT INTO audio_positions(book_id,data) VALUES(?1,?2) ON CONFLICT(book_id) DO UPDATE SET data=excluded.data", params![id,serde_json::to_string(position)?])?;
+        } else {
+            tx.execute("DELETE FROM audio_positions WHERE book_id=?1", [id])?;
+        }
+        let summary = tx.query_row("SELECT id,title,author,cover,chapter,offset,speed,CASE WHEN total=0 THEN 0.0 ELSE 1.0*done/total END FROM books WHERE id=?1", [id], |r| Ok(BookSummary { id:r.get(0)?,title:r.get(1)?,author:r.get(2)?,cover:r.get(3)?,chapter:r.get(4)?,offset:r.get(5)?,speed:r.get(6)?,progress:r.get(7)? })).optional()?.ok_or(Error::NotFound)?;
+        tx.commit()?;
+        Ok(summary)
     }
     /// # Errors
     /// Returns an error if the chapter is absent or the bookmark cannot be stored.
@@ -393,6 +502,37 @@ impl Store {
     /// # Errors
     /// Returns an error if the settings are invalid or cannot be stored.
     pub fn save_preferences(&self, prefs: &Preferences) -> Result<Preferences> {
+        crate::audio::validate_dictionary(&prefs.dictionary)?;
+        if prefs.open_router_model_settings.len() > 512 {
+            return Err(Error::Format("Слишком много настроек моделей".into()));
+        }
+        for (model, settings) in &prefs.open_router_model_settings {
+            if model.is_empty()
+                || model.len() > 256
+                || model.chars().any(char::is_control)
+                || settings.resource_revision.as_ref().is_some_and(|revision| {
+                    revision.is_empty()
+                        || revision.len() > 512
+                        || revision.chars().any(char::is_control)
+                })
+                || settings
+                    .input_limit
+                    .as_ref()
+                    .is_some_and(|limit| limit.value == 0)
+                || settings.transport.as_ref().is_some_and(|transport| {
+                    transport
+                        .pcm_sample_rate
+                        .is_some_and(|rate| !(8000..=192_000).contains(&rate))
+                        || transport
+                            .pcm_channels
+                            .is_some_and(|channels| channels == 0 || channels > 8)
+                })
+            {
+                return Err(Error::Format(
+                    "Некорректные настройки модели озвучивания".into(),
+                ));
+            }
+        }
         if !prefs.volume.is_finite() || !(0.0..=1.0).contains(&prefs.volume) {
             return Err(Error::Format("Громкость должна быть от 0 до 1".into()));
         }
@@ -459,8 +599,9 @@ impl Store {
     /// Returns an error if the legacy data is malformed, unreadable, or cannot be stored.
     #[allow(clippy::too_many_lines)] // Validate all legacy data before the atomic database transaction.
     pub fn import_legacy(&self, root: &Path) -> Result<usize> {
-        fn read(path: &Path, limit: u64) -> Result<Vec<u8>> {
+        fn read(path: &Path, limit: u64, used: &mut u64) -> Result<Vec<u8>> {
             use std::io::Read;
+            let limit = limit.min(MAX_IMPORT_BATCH_BYTES.saturating_sub(*used));
             let file = match fs::File::open(path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -468,6 +609,8 @@ impl Store {
                 }
                 Err(e) => return Err(e.into()),
             };
+            let advertised = file.metadata()?.len();
+            charge_import(used, advertised)?;
             let mut bytes = Vec::new();
             file.take(limit + 1).read_to_end(&mut bytes)?;
             if bytes.len() as u64 > limit {
@@ -475,10 +618,14 @@ impl Store {
                     "Файл старой библиотеки слишком большой".into(),
                 ));
             }
+            if bytes.len() as u64 > advertised {
+                charge_import(used, bytes.len() as u64 - advertised)?;
+            }
             Ok(bytes)
         }
+        let mut used = 0;
         let index: serde_json::Value =
-            serde_json::from_slice(&read(&root.join("index.json"), 8 * 1024 * 1024)?)?;
+            serde_json::from_slice(&read(&root.join("index.json"), 8 * 1024 * 1024, &mut used)?)?;
         let mut prefs: Preferences = serde_json::from_value(
             index
                 .get("prefs")
@@ -505,6 +652,9 @@ impl Store {
             .get("books")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| Error::Format("В index.json отсутствует список книг".into()))?;
+        if ids.len() > MAX_IMPORT_BATCH_BOOKS {
+            return Err(Error::Format("Слишком много книг в одном импорте".into()));
+        }
         let mut books = Vec::new();
         for id in ids {
             let id = id
@@ -516,7 +666,11 @@ impl Store {
             {
                 return Err(Error::Format("Некорректный идентификатор книги".into()));
             }
-            let bytes = read(&root.join(format!("{id}.json")), 100 * 1024 * 1024)?;
+            let bytes = read(
+                &root.join(format!("{id}.json")),
+                100 * 1024 * 1024,
+                &mut used,
+            )?;
             let mut book: Book = serde_json::from_slice(&bytes)?;
             if book.id != id || book.chapters.is_empty() {
                 return Err(Error::Format(
@@ -724,6 +878,65 @@ mod tests {
         let book = store.book(&summary.id)?;
         assert_eq!(book.offset, 3);
         assert_eq!(book.marks[0].id, mark.id);
+        drop(store);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn persists_exact_audio_position_and_clears_it_on_manual_seek() -> Result<()> {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&dir)?;
+        let source = dir.join("book.txt");
+        fs::write(&source, "Первый текст.")?;
+        let store = Store::open(&dir)?;
+        let summary = store
+            .import(&[source.to_string_lossy().into_owned()])?
+            .remove(0);
+        let position = AudioPosition {
+            chapter: 0,
+            block_id: "a".repeat(64),
+            profile_id: "b".repeat(64),
+            seconds: 1.75,
+        };
+        store.position_with_audio(&summary.id, 0, 2, 1.0, Some(&position))?;
+        assert_eq!(
+            store.reader_book(&summary.id)?.audio_position,
+            Some(position.clone())
+        );
+        let mut invalid = position;
+        invalid.seconds = f64::NAN;
+        assert!(
+            store
+                .position_with_audio(&summary.id, 0, 3, 1.0, Some(&invalid))
+                .is_err()
+        );
+        assert_eq!(store.reader_book(&summary.id)?.offset, 2);
+        store.position(&summary.id, 0, 3, 1.0)?;
+        assert!(store.reader_book(&summary.id)?.audio_position.is_none());
+        drop(store);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn import_is_atomic_on_invalid_book() -> Result<()> {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&dir)?;
+        let good = dir.join("good.txt");
+        let bad = dir.join("bad.txt");
+        fs::write(&good, "valid text")?;
+        fs::write(&bad, [0xff])?;
+        let store = Store::open(&dir)?;
+        assert!(
+            store
+                .import(&[
+                    good.to_string_lossy().into_owned(),
+                    bad.to_string_lossy().into_owned()
+                ])
+                .is_err()
+        );
+        assert!(store.books()?.is_empty());
         drop(store);
         fs::remove_dir_all(dir)?;
         Ok(())

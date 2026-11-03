@@ -30,6 +30,8 @@ pub struct Book {
     pub chapter: usize,
     pub offset: usize,
     pub speed: f32,
+    #[serde(default, rename = "audioPosition")]
+    pub audio_position: Option<AudioPosition>,
     pub marks: Vec<Mark>,
     #[serde(default, skip_deserializing)]
     pub passages: Vec<Passage>,
@@ -47,6 +49,7 @@ impl Default for Book {
             chapter: 0,
             offset: 0,
             speed: 1.0,
+            audio_position: None,
             marks: Vec::new(),
             passages: Vec::new(),
             progress: 0.0,
@@ -79,9 +82,19 @@ pub struct ReaderBook {
     pub chapter: usize,
     pub offset: usize,
     pub speed: f32,
+    #[serde(rename = "audioPosition")]
+    pub audio_position: Option<AudioPosition>,
     pub marks: Vec<Mark>,
     pub passages: Vec<Passage>,
     pub progress: f64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioPosition {
+    pub chapter: usize,
+    pub block_id: String,
+    pub profile_id: String,
+    pub seconds: f64,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -202,6 +215,8 @@ pub struct Preferences {
     pub open_router_model: Option<String>,
     pub open_router_voice: Option<String>,
     pub open_router_billing_units: BTreeMap<String, BillingUnit>,
+    #[serde(default)]
+    pub open_router_model_settings: BTreeMap<String, crate::SynthesisSettings>,
     #[serde(default = "default_volume")]
     pub volume: f64,
     pub dictionary: BTreeMap<String, String>,
@@ -227,6 +242,7 @@ impl Default for Preferences {
             open_router_model: None,
             open_router_voice: None,
             open_router_billing_units: BTreeMap::new(),
+            open_router_model_settings: BTreeMap::new(),
             volume: default_volume(),
             dictionary: BTreeMap::new(),
         }
@@ -246,6 +262,15 @@ mod tests {
                 .is_some()
         );
         assert_eq!(prefs.volume, 1.0);
+        assert_eq!(prefs.open_router_model_settings, BTreeMap::new());
+        assert_eq!(
+            serde_json::to_value(&prefs)?["openRouterModelSettings"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            serde_json::to_value(Preferences::default())?["openRouterModelSettings"],
+            serde_json::json!({})
+        );
         Ok(())
     }
     #[test]

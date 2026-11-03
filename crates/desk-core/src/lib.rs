@@ -6,16 +6,17 @@ mod model;
 mod store;
 
 pub use audio::{
-    AUDIO_BLOCK_MAX_ESCAPED_BYTES, AUDIO_BLOCK_MAX_PASSAGES, AudioBlock, AudioCache, AudioPart,
-    AudioProfile, CachedAudio, ChapterPlanner, MAX_MANIFEST_BYTES, ManifestIssue, ManifestReport,
-    OfflineManifest, plan_book, plan_chapter, plan_chapter_v1,
+    AUDIO_BLOCK_MAX_ESCAPED_BYTES, AUDIO_BLOCK_MAX_PASSAGES, AudioBlock, AudioCache, AudioFormat,
+    AudioPart, AudioProfile, AudioTiming, AudioTransport, CachedAudio, CachedAudioBytes,
+    ChapterPlanner, InputLimit, InputUnit, LimitSource, MAX_MANIFEST_BYTES, ManifestIssue,
+    ManifestReport, OfflineManifest, SynthesisSettings, plan_book, plan_chapter, plan_chapter_v1,
 };
 pub use edition::{EDITION_PLAN_VERSION, EditionChapter, EditionPlan, MAX_EDITION_PLAN_BYTES};
 pub use generation::{GenerationAttempt, GenerationJournal, GenerationPrepare, GenerationState};
 pub use importer::import_book;
 pub use model::{
-    BillingUnit, Book, BookSummary, BookmarkEntry, Chapter, ChapterSummary, Mark, Passage,
-    Preferences, ReaderBook, split_passages,
+    AudioPosition, BillingUnit, Book, BookSummary, BookmarkEntry, Chapter, ChapterSummary, Mark,
+    Passage, Preferences, ReaderBook, split_passages,
 };
 pub use store::Store;
 

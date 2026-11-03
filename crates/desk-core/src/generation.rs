@@ -31,6 +31,7 @@ pub struct GenerationAttempt {
     pub finished_at: Option<i64>,
     pub provider_response_id: Option<String>,
     pub retry_of: Option<String>,
+    pub provider_cost: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,10 +99,11 @@ fn read_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<GenerationAttempt> 
         finished_at: row.get(7)?,
         provider_response_id: row.get(8)?,
         retry_of: row.get(9)?,
+        provider_cost: row.get(10)?,
     })
 }
 
-const SELECT_FIELDS: &str = "id,block_id,profile_id,text_hash,state,prepared_at,submitted_at,finished_at,provider_response_id,retry_of";
+const SELECT_FIELDS: &str = "id,block_id,profile_id,text_hash,state,prepared_at,submitted_at,finished_at,provider_response_id,retry_of,provider_cost";
 
 fn effective_attempt(
     conn: &Connection,
@@ -143,19 +145,19 @@ impl GenerationJournal {
             CREATE TABLE IF NOT EXISTS generation_attempts (
                 id TEXT PRIMARY KEY, block_id TEXT NOT NULL, profile_id TEXT NOT NULL,
                 text_hash TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','submitted','completed','uncertain')),
-                prepared_at INTEGER NOT NULL, submitted_at INTEGER, finished_at INTEGER, provider_response_id TEXT, retry_of TEXT
+                prepared_at INTEGER NOT NULL, submitted_at INTEGER, finished_at INTEGER, provider_response_id TEXT, retry_of TEXT, provider_cost TEXT
             );
             CREATE INDEX IF NOT EXISTS generation_attempts_key ON generation_attempts(block_id,profile_id,text_hash);")?;
-        let has_retry_of = {
+        let columns = {
             let mut stmt = tx.prepare("PRAGMA table_info(generation_attempts)")?;
             let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            columns
-                .collect::<std::result::Result<Vec<_>, _>>()?
-                .iter()
-                .any(|name| name == "retry_of")
+            columns.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        if !has_retry_of {
+        if !columns.iter().any(|name| name == "retry_of") {
             tx.execute_batch("ALTER TABLE generation_attempts ADD COLUMN retry_of TEXT;")?;
+        }
+        if !columns.iter().any(|name| name == "provider_cost") {
+            tx.execute_batch("ALTER TABLE generation_attempts ADD COLUMN provider_cost TEXT;")?;
         }
         tx.execute_batch("CREATE INDEX IF NOT EXISTS generation_attempts_canonical ON generation_attempts(block_id,text_hash);")?;
         tx.commit()?;
@@ -272,6 +274,7 @@ impl GenerationJournal {
             finished_at: None,
             provider_response_id: None,
             retry_of,
+            provider_cost: None,
         };
         tx.execute("INSERT INTO generation_attempts(id,block_id,profile_id,text_hash,state,prepared_at,retry_of) VALUES (?1,?2,?3,?4,'prepared',?5,?6)", params![attempt.id, attempt.block_id, attempt.profile_id, attempt.text_hash, attempt.prepared_at, attempt.retry_of])?;
         tx.commit()?;
@@ -334,6 +337,96 @@ impl GenerationJournal {
         Self::require_transition(changed)
     }
 
+    /// Reads an individual generation attempt for usage reconciliation.
+    ///
+    /// # Errors
+    /// Returns an error if the database cannot be read.
+    pub fn attempt(&self, id: &str) -> Result<Option<GenerationAttempt>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {SELECT_FIELDS} FROM generation_attempts WHERE id=?1"),
+                [id],
+                read_attempt,
+            )
+            .optional()?)
+    }
+
+    /// Reads attempt history for a bounded set of canonical block IDs, in creation order.
+    ///
+    /// # Errors
+    /// Returns an error for an oversized request/history or database failure.
+    pub fn attempts_for_blocks(&self, ids: &[String]) -> Result<Vec<GenerationAttempt>> {
+        const MAX_IDS: usize = 100_000;
+        const MAX_ATTEMPTS: usize = 100_000;
+        if ids.len() > MAX_IDS
+            || ids.iter().any(|id| {
+                id.len() != 64
+                    || !id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        {
+            return Err(Error::Format(
+                "Некорректный список аудиоблоков для сверки расходов".into(),
+            ));
+        }
+        let unique: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let mut rows = Vec::new();
+        {
+            let mut statement = tx.prepare(&format!("SELECT rowid,{SELECT_FIELDS} FROM generation_attempts WHERE block_id=?1 ORDER BY rowid"))?;
+            for id in unique {
+                let mut found = statement.query([id])?;
+                while let Some(row) = found.next()? {
+                    if rows.len() == MAX_ATTEMPTS {
+                        return Err(Error::Format(
+                            "Слишком много попыток для сверки расходов".into(),
+                        ));
+                    }
+                    let rowid: i64 = row.get(0)?;
+                    let attempt = GenerationAttempt {
+                        id: row.get(1)?,
+                        block_id: row.get(2)?,
+                        profile_id: row.get(3)?,
+                        text_hash: row.get(4)?,
+                        state: match row.get::<_, String>(5)?.as_str() {
+                            "prepared" => GenerationState::Prepared,
+                            "submitted" => GenerationState::Submitted,
+                            "completed" => GenerationState::Completed,
+                            "uncertain" => GenerationState::Uncertain,
+                            _ => {
+                                return Err(Error::Format("Некорректное состояние журнала".into()));
+                            }
+                        },
+                        prepared_at: row.get(6)?,
+                        submitted_at: row.get(7)?,
+                        finished_at: row.get(8)?,
+                        provider_response_id: row.get(9)?,
+                        retry_of: row.get(10)?,
+                        provider_cost: row.get(11)?,
+                    };
+                    rows.push((rowid, attempt));
+                }
+            }
+        }
+        tx.commit()?;
+        rows.sort_unstable_by_key(|(rowid, _)| *rowid);
+        Ok(rows.into_iter().map(|(_, attempt)| attempt).collect())
+    }
+
+    /// Records immutable provider-reported USD usage without floating-point conversion.
+    ///
+    /// # Errors
+    /// Returns an error for invalid cost, a conflicting value, or an ineligible attempt.
+    pub fn note_cost(&self, id: &str, cost: &str) -> Result<()> {
+        if !valid_decimal_cost(cost) {
+            return Err(Error::Format("Некорректная стоимость генерации".into()));
+        }
+        let changed = self.conn.execute("UPDATE generation_attempts SET provider_cost=?2 WHERE id=?1 AND state IN ('submitted','completed','uncertain') AND (provider_cost IS NULL OR provider_cost=?2)", params![id, cost])?;
+        Self::require_transition(changed)
+    }
+
     fn validate_response_id(value: Option<&str>) -> Result<()> {
         if value.is_some_and(|value| {
             value.is_empty()
@@ -381,6 +474,33 @@ impl GenerationJournal {
     }
 }
 
+fn valid_decimal_cost(cost: &str) -> bool {
+    if cost.is_empty() || cost.len() > 128 {
+        return false;
+    }
+    let mut parts = cost.split(['e', 'E']);
+    let mantissa = parts.next().unwrap_or("");
+    let exponent = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    if let Some(exponent) = exponent {
+        let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        if exponent.is_empty() || !exponent.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+    }
+    let mut pieces = mantissa.split('.');
+    let integer = pieces.next().unwrap_or("");
+    let fractional = pieces.next();
+    !integer.is_empty()
+        && integer.bytes().all(|byte| byte.is_ascii_digit())
+        && fractional.is_none_or(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && pieces.next().is_none()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -409,6 +529,7 @@ mod tests {
                 model_voice: None,
                 dictionary: BTreeMap::new(),
                 max_escaped_bytes: None,
+                synthesis: None,
             },
         )
     }
@@ -527,6 +648,64 @@ mod tests {
         ));
         let third = ready(journal.prepare_with_consent(&block, &profile, Some(&second.id))?);
         assert_eq!(third.retry_of.as_deref(), Some(second.id.as_str()));
+        drop(journal);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_cost_is_decimal_and_immutable_across_reopen() -> Result<()> {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let (block, profile) = fixture();
+        let journal = GenerationJournal::open(&dir)?;
+        let attempt = ready(journal.prepare(&block, &profile, false)?);
+        assert!(journal.note_cost(&attempt.id, "0.01").is_err());
+        journal.mark_submitted(&attempt.id)?;
+        for bad in ["-1", "NaN", "1e", "0.1.2", "0; DROP TABLE"] {
+            assert!(journal.note_cost(&attempt.id, bad).is_err());
+        }
+        journal.note_cost(&attempt.id, "1.25e-6")?;
+        journal.note_cost(&attempt.id, "1.25e-6")?;
+        assert!(journal.note_cost(&attempt.id, "0.01").is_err());
+        journal.mark_uncertain(&attempt.id, None)?;
+        drop(journal);
+        let journal = GenerationJournal::open(&dir)?;
+        assert_eq!(
+            journal
+                .attempt(&attempt.id)?
+                .unwrap()
+                .provider_cost
+                .as_deref(),
+            Some("1.25e-6")
+        );
+        drop(journal);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn history_is_deduplicated_and_keeps_submission_order() -> Result<()> {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let (first_block, profile) = fixture();
+        let mut second_block = first_block.clone();
+        second_block.id = "b".repeat(64);
+        let journal = GenerationJournal::open(&dir)?;
+        let first = ready(journal.prepare(&first_block, &profile, false)?);
+        journal.mark_submitted(&first.id)?;
+        journal.note_response(&first.id, Some("gen-first"))?;
+        journal.note_cost(&first.id, "0.001")?;
+        journal.mark_uncertain(&first.id, None)?;
+        let second = ready(journal.prepare(&second_block, &profile, false)?);
+        let attempts = journal.attempts_for_blocks(&[
+            second_block.id,
+            first_block.id.clone(),
+            first_block.id,
+        ])?;
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].id, first.id);
+        assert_eq!(attempts[0].provider_cost.as_deref(), Some("0.001"));
+        assert_eq!(attempts[1].id, second.id);
+        assert!(journal.attempts_for_blocks(&["bad".into()]).is_err());
         drop(journal);
         fs::remove_dir_all(dir)?;
         Ok(())

@@ -3,17 +3,20 @@ import { invoke, isTauri, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import RangeInput from "./components/RangeInput.vue";
 import { useVirtualizer } from "@tanstack/vue-virtual";
 import type { ComponentPublicInstance } from "vue";
 import { speechChunks } from "./utils/speech";
 import {
   billingUnitDirty,
+  modelSettingsWithLimit,
+  modelSettingsWithRevision,
+  normalizePreferences,
   preferencesSnapshot,
   withCurrentBillingUnits,
 } from "./utils/preferences";
 import { PreviewOwner } from "./utils/preview-owner";
 import {
-  shouldPollOffline,
   shouldRefreshPausedQuote,
   isStaleQuoteError,
 } from "./utils/offline-refresh";
@@ -32,12 +35,14 @@ import {
   AudioBlockLoader,
   audioErrorCode,
   audioErrorMessage,
-  PlaybackGate,
   blockForOffset,
   blockOffsetFraction,
   blockPosition,
 } from "./utils/audio-cache";
 import { PlaybackInterest } from "./utils/playback-interest";
+import { PlaybackController } from "./utils/playback-controller";
+import { startingBlockSeconds } from "./utils/audio-position";
+import { timedSeek, type TimedPart } from "./utils/audio-timing";
 import {
   LibraryBig,
   BookOpen,
@@ -90,6 +95,7 @@ const defaults: Preferences = {
   voice: null,
   openRouterModel: null,
   openRouterBillingUnits: {},
+  openRouterModelSettings: {},
   openRouterVoice: null,
   volume: 1,
   dictionary: {},
@@ -114,6 +120,13 @@ const offlineCloseButton = ref<HTMLButtonElement | null>(null);
 let offlinePreviousFocus: HTMLElement | null = null;
 const offlineQuote = ref<OfflineQuote | null>(null);
 const offlineRetryConfirmed = ref(false);
+const maxNewBlocks = ref<number | null>(null);
+const maxCostUsd = ref("");
+const validMaxCost = computed(
+  () =>
+    !maxCostUsd.value.trim() || /^\d+(?:\.\d+)?$/.test(maxCostUsd.value.trim()),
+);
+const allowUnknownCost = ref(false);
 const offlineBusy = ref(false);
 const offlineError = ref("");
 const offlineInfo = ref("");
@@ -158,10 +171,12 @@ const selectedInFilter = computed(() =>
     (model) => model.id === prefs.value.openRouterModel,
   ),
 );
-let generation = 0;
 let loopRunning = false;
 let currentAudioBlock: AudioBlock | null = null;
-const playbackGate = new PlaybackGate();
+let currentAudioProfile: string | null = null;
+let currentAudioReady = false;
+let currentTimedParts: TimedPart[] | null = null;
+const accurateTransitions = ref(false);
 let playbackInterest: PlaybackInterest | null = null;
 const retryPrompt = ref<{ message: string; attemptId: string } | null>(null);
 const retryDialog = ref<HTMLElement | null>(null);
@@ -215,26 +230,52 @@ function confirmRetry(error: unknown): Promise<boolean> {
 function withdrawPlaybackInterest() {
   if (playbackInterest) void playbackInterest.update([]).catch(report);
 }
-let statusTimer: ReturnType<typeof setTimeout> | undefined;
-const audioLoader = new AudioBlockLoader(async (key, retry, context) => {
-  if (!context) throw new Error("Нет активной сессии воспроизведения");
-  const { bookId, chapter, blockId, offline } = JSON.parse(key) as {
-    bookId: string;
-    chapter: number;
-    blockId: string;
-    offline: boolean;
-  };
-  return invoke<SpeechAudio>("audio_block", {
-    request: {
-      bookId,
-      chapter,
-      blockId,
-      offline,
-      speed: 1,
-      retry,
-      ...context,
-    },
-  });
+function releaseAudio(audio: SpeechAudio) {
+  if (audio.resourceId)
+    void invoke("audio_resource_release", { token: audio.resourceId }).catch(
+      report,
+    );
+}
+const audioLoader = new AudioBlockLoader(
+  async (key, retry, context) => {
+    if (!context) throw new Error("Нет активной сессии воспроизведения");
+    const { bookId, chapter, blockId, offline } = JSON.parse(key) as {
+      bookId: string;
+      chapter: number;
+      blockId: string;
+      offline: boolean;
+    };
+    return invoke<SpeechAudio>("audio_block", {
+      request: {
+        bookId,
+        chapter,
+        blockId,
+        offline,
+        speed: 1,
+        retry,
+        ...context,
+      },
+    });
+  },
+  3,
+  releaseAudio,
+);
+const playback = new PlaybackController({
+  fetch: ({
+    key,
+    retry,
+    context,
+  }: {
+    key: string;
+    retry: boolean;
+    context: Parameters<AudioBlockLoader["get"]>[2];
+  }) => audioLoader.get(key, retry, context),
+  discard: ({ key }, result) => {
+    audioLoader.takeResource(key, result);
+    releaseAudio(result);
+  },
+  createAudio: (source: string) => new Audio(source),
+  now: Date.now,
 });
 function audioKey(
   bookId: string,
@@ -246,7 +287,7 @@ function audioKey(
   return JSON.stringify({ bookId, chapter, blockId, profileId, offline });
 }
 function waitForPlayback(token: number) {
-  return playbackGate.wait(() => token === generation);
+  return playback.wait(token);
 }
 let audio: HTMLAudioElement | null = null;
 let audioAttempt = 0;
@@ -361,6 +402,7 @@ function savePositionNow() {
     chapter: b.chapter,
     offset: b.offset,
     speed: b.speed,
+    audioPosition: b.audioPosition,
   };
   positionQueue = positionQueue
     .then(async () => {
@@ -394,9 +436,26 @@ function savePrefs() {
     void savePrefsNow().catch(() => {});
   }, 250);
 }
+function captureAudioPosition() {
+  if (
+    book.value &&
+    audio &&
+    currentAudioBlock &&
+    currentAudioProfile &&
+    currentAudioReady &&
+    Number.isFinite(audio.currentTime)
+  )
+    book.value.audioPosition = {
+      chapter: book.value.chapter,
+      blockId: currentAudioBlock.id,
+      profileId: currentAudioProfile,
+      seconds: audio.currentTime,
+    };
+}
 function stop() {
+  captureAudioPosition();
   preview.cancel();
-  generation++;
+  playback.cancel();
   audioAttempt++;
   resolveRetry(false);
   withdrawPlaybackInterest();
@@ -404,7 +463,6 @@ function stop() {
   currentPrefetchBlockId = undefined;
   playing.value = false;
   paused.value = false;
-  playbackGate.cancel();
   const player = audio;
   audioCancel?.();
   audioCancel = null;
@@ -414,6 +472,10 @@ function stop() {
     if (audio === player) audio = null;
   }
   currentAudioBlock = null;
+  currentAudioProfile = null;
+  currentAudioReady = false;
+  currentTimedParts = null;
+  accurateTransitions.value = false;
   void savePositionNow();
 }
 function tokenIsActive(player: HTMLAudioElement) {
@@ -424,10 +486,11 @@ function pausePlayback() {
   playing.value = false;
   paused.value = true;
   audioAttempt++;
-  playbackGate.pause();
+  playback.pause();
   if (retryPrompt.value) resolveRetry(false);
   withdrawPlaybackInterest();
   audio?.pause();
+  captureAudioPosition();
   void savePositionNow();
 }
 function indexAt(offset: number) {
@@ -459,6 +522,7 @@ async function openBook(id: string, chapter?: number, offset?: number) {
         chapter: chapter ?? loaded.chapter,
         offset: offset ?? loaded.offset,
         speed: loaded.speed,
+        audioPosition: null,
       };
       positionQueue = positionQueue
         .then(async () => {
@@ -493,14 +557,17 @@ function selectPassage(index: number, resume = false) {
   if (
     currentAudioBlock &&
     audio &&
+    currentAudioReady &&
     currentAudioBlock.start <= passage.start &&
     passage.start < currentAudioBlock.end &&
     Number.isFinite(audio.duration)
   ) {
     audio.currentTime =
+      (currentTimedParts && timedSeek(currentTimedParts, passage.start)) ??
       blockOffsetFraction(currentAudioBlock, passage.start) * audio.duration;
     active.value = index;
     b.offset = passage.start;
+    captureAudioPosition();
     completed.value = false;
     savePosition();
     void jump(index);
@@ -509,6 +576,7 @@ function selectPassage(index: number, resume = false) {
   stop();
   active.value = index;
   b.offset = passage.start;
+  b.audioPosition = null;
   completed.value = false;
   savePosition();
   void jump(index);
@@ -545,7 +613,7 @@ function onReaderScroll() {
 }
 async function speakChunk(text: string, speed: number, token: number) {
   await preview.wait();
-  if (token !== generation) return;
+  if (token !== playback.token) return;
   await synthesizeThenPlay(
     () =>
       invoke<SpeechAudio>("synthesize", {
@@ -555,7 +623,11 @@ async function speakChunk(text: string, speed: number, token: number) {
       }),
     (result) =>
       new Promise<void>((resolve, reject) => {
-        const player = new Audio(`data:${result.mime};base64,${result.data}`);
+        const player = new Audio(
+          result.resourceId
+            ? convertFileSrc(result.resourceId, "readio-audio")
+            : `data:${result.mime};base64,${result.data}`,
+        );
         audioBaseRate = result.playbackRate ?? 1;
         audioSynthesizedSpeed = 1;
         configurePlaybackRate(player, audioBaseRate);
@@ -584,12 +656,12 @@ async function speakChunk(text: string, speed: number, token: number) {
             finish(error instanceof Error ? error : new Error(String(error))),
           );
       }),
-    () => token === generation,
+    () => token === playback.token,
   );
 }
 async function speak(text: string, speed: number, token: number) {
   for (const chunk of speechChunks(text)) {
-    if (token !== generation) return;
+    if (token !== playback.token) return;
     await speakChunk(chunk, speed, token);
   }
 }
@@ -606,7 +678,7 @@ async function play() {
   if (paused.value && loopRunning) {
     paused.value = false;
     playing.value = true;
-    playbackGate.resume();
+    playback.resume();
     if (audio) {
       const player = audio;
       const attempt = ++audioAttempt;
@@ -636,7 +708,7 @@ async function play() {
         if (attempt === audioAttempt && tokenIsActive(player)) {
           playing.value = false;
           paused.value = true;
-          playbackGate.pause();
+          playback.pause();
           report(e);
         }
       }
@@ -647,17 +719,19 @@ async function play() {
   if (completed.value) {
     active.value = replayIndex(true, active.value);
     initial.offset = initial.passages[active.value]!.start;
+    initial.audioPosition = null;
     completed.value = false;
   }
   stop();
-  const token = generation;
+  const token = playback.token;
   playing.value = true;
   loopRunning = true;
   notice.value = "";
+  let ownedAudio: SpeechAudio | null = null;
   try {
     await savePrefsNow();
     let explicitRetry = true;
-    while (token === generation && book.value) {
+    while (token === playback.token && book.value) {
       if (!(await waitForPlayback(token))) return;
       const current = book.value;
       const offline = !!offlineSource.value[current.id];
@@ -682,27 +756,32 @@ async function play() {
         let confirmedAttempt: string | undefined;
         while (true) {
           if (!(await waitForPlayback(token))) return;
-          if (token !== generation) return;
+          if (token !== playback.token) return;
           if (paused.value) continue;
           if (!playbackInterest)
             throw new Error("Нет активной сессии воспроизведения");
           const context = await playbackInterest.update([block.id]);
-          if (!context || token !== generation || paused.value) continue;
+          if (!context || token !== playback.token || paused.value) continue;
           try {
-            result = await audioLoader.get(
-              key,
-              explicitRetry || !!confirmedAttempt,
-              { ...context, confirmedAttempt },
+            result = await playback.load(
+              {
+                key,
+                retry: explicitRetry || !!confirmedAttempt,
+                context: { ...context, confirmedAttempt },
+              },
+              token,
             );
+            audioLoader.takeResource(key, result);
+            ownedAudio = result;
             explicitRetry = false;
             break;
           } catch (error) {
-            if (token !== generation) return;
+            if (token !== playback.token) return;
             if (audioErrorCode(error) === "cancelled") continue;
             if (audioErrorCode(error) !== "retry_required") throw error;
             do {
               if (!(await waitForPlayback(token))) return;
-              if (token !== generation) return;
+              if (token !== playback.token) return;
             } while (paused.value);
             const attemptId =
               typeof error === "object" &&
@@ -713,7 +792,7 @@ async function play() {
                 : undefined;
             const confirmed = await confirmRetry(error);
             if (
-              token !== generation ||
+              token !== playback.token ||
               book.value?.id !== current.id ||
               book.value?.chapter !== current.chapter
             )
@@ -727,119 +806,107 @@ async function play() {
         }
         do {
           if (!(await waitForPlayback(token))) return;
-          if (token !== generation) return;
+          if (token !== playback.token) return;
         } while (paused.value);
         const startingOffset = Math.max(
           block.start,
           Math.min(current.offset, block.end),
         );
-        await new Promise<void>((resolve, reject) => {
-          const player = new Audio(`data:${result.mime};base64,${result.data}`);
-          audioBaseRate = result.playbackRate ?? 1;
-          audioSynthesizedSpeed = 1;
-          configurePlaybackRate(player, audioBaseRate * current.speed);
-          player.volume = Math.min(1, Math.max(0, prefs.value.volume));
-          audio = player;
-          currentAudioBlock = block;
-          let settled = false;
-          let lastSaved = 0;
-          const finish = (error?: Error) => {
-            if (settled) return;
-            settled = true;
-            player.ontimeupdate = null;
-            player.onloadedmetadata = null;
-            player.onended = null;
-            player.onerror = null;
-            if (audio === player) {
-              audio = null;
-              audioCancel = null;
-              currentAudioBlock = null;
-            }
-            if (error) reject(error);
-            else resolve();
-          };
-          audioCancel = () => finish();
-          player.onloadedmetadata = () => {
-            if (Number.isFinite(player.duration))
-              player.currentTime =
-                blockOffsetFraction(block, startingOffset) * player.duration;
-          };
-          player.ontimeupdate = () => {
-            if (
-              !playing.value ||
-              token !== generation ||
-              !Number.isFinite(player.duration) ||
-              player.duration <= 0
+        audioBaseRate = result.playbackRate ?? 1;
+        audioSynthesizedSpeed = 1;
+        const next = plan.blocks[index + 1];
+        currentPrefetchKey = next
+          ? audioKey(
+              current.id,
+              current.chapter,
+              next.id,
+              plan.profileId,
+              offline,
             )
-              return;
-            const position = blockPosition(
-              block,
-              player.currentTime / player.duration,
-            );
-            if (!position) return;
-            const index = indexAt(position.offset);
-            const changed = index !== active.value;
-            active.value = index;
-            current.offset = position.offset;
-            if (changed || Date.now() - lastSaved >= 5000) {
-              lastSaved = Date.now();
-              savePosition();
-            }
-            if (changed) void jump();
-          };
-          player.onended = () => finish();
-          player.onerror = () =>
-            finish(new Error("Не удалось воспроизвести аудио"));
-          const next = plan.blocks[index + 1];
-          currentPrefetchKey = next
-            ? audioKey(
-                current.id,
-                current.chapter,
-                next.id,
-                plan.profileId,
-                offline,
-              )
-            : undefined;
-          currentPrefetchBlockId = next?.id;
-          const attempt = ++audioAttempt;
-          void player
-            .play()
-            .then(async () => {
-              if (
-                token !== generation ||
-                attempt !== audioAttempt ||
-                !playing.value ||
-                paused.value ||
-                !next ||
-                !playbackInterest
-              )
-                return;
-              const context = await playbackInterest.update([
-                block.id,
-                next.id,
-              ]);
-              if (
-                context &&
-                token === generation &&
-                attempt === audioAttempt &&
-                playing.value &&
-                !paused.value
-              )
-                audioLoader.prefetch(currentPrefetchKey, true, context);
-            })
-            .catch((error: unknown) => {
-              if (
-                attempt === audioAttempt &&
-                token === generation &&
-                !paused.value
-              )
-                finish(
-                  error instanceof Error ? error : new Error(String(error)),
-                );
-            });
-        });
-        if (token !== generation) return;
+          : undefined;
+        currentPrefetchBlockId = next?.id;
+        const attempt = ++audioAttempt;
+        const session = playback.block(
+          result.resourceId
+            ? convertFileSrc(result.resourceId, "readio-audio")
+            : `data:${result.mime};base64,${result.data}`,
+          {
+            block,
+            startingOffset,
+            startingSeconds: startingBlockSeconds(
+              current.audioPosition,
+              current.chapter,
+              block.id,
+              plan.profileId,
+            ),
+            timings: result.timings,
+            onTimingMode: (parts) => {
+              currentTimedParts = parts;
+              accurateTransitions.value = !!parts;
+            },
+            rate: audioBaseRate * current.speed,
+            volume: prefs.value.volume,
+            isCurrent: () => token === playback.token,
+            isPlaying: () => playing.value && !paused.value,
+            isStartCurrent: () => attempt === audioAttempt,
+            onReady: () => {
+              currentAudioReady = true;
+            },
+            onPosition: (offset, seconds, shouldSave) => {
+              current.audioPosition = {
+                chapter: current.chapter,
+                blockId: block.id,
+                profileId: plan.profileId,
+                seconds,
+              };
+              const index = indexAt(offset);
+              const changed = index !== active.value;
+              active.value = index;
+              current.offset = offset;
+              if (changed || shouldSave) savePosition();
+              if (changed) void jump();
+            },
+            onStarted: () => {
+              if (!next || !playbackInterest) return;
+              void playbackInterest
+                .update([block.id, next.id])
+                .then((context) => {
+                  if (
+                    context &&
+                    token === playback.token &&
+                    attempt === audioAttempt &&
+                    playing.value &&
+                    !paused.value
+                  )
+                    audioLoader.prefetch(currentPrefetchKey, true, context);
+                })
+                .catch(report);
+            },
+          },
+        );
+        audio = session.player;
+        currentAudioBlock = block;
+        currentAudioProfile = plan.profileId;
+        audioCancel = session.cancel;
+        session.start();
+        try {
+          await session.finished;
+        } finally {
+          if (audio === session.player) {
+            audio = null;
+            audioCancel = null;
+            currentAudioBlock = null;
+            currentAudioProfile = null;
+            currentAudioReady = false;
+            currentTimedParts = null;
+            accurateTransitions.value = false;
+          }
+        }
+        releaseAudio(result);
+        ownedAudio = null;
+        if (token !== playback.token) return;
         current.offset = block.end;
+        current.audioPosition = null;
         savePosition();
       }
       if (current.chapter + 1 >= current.chapters.length) {
@@ -856,31 +923,33 @@ async function play() {
         chapter: current.chapter + 1,
         offset: 0,
         speed: current.speed,
+        audioPosition: null,
       };
       positionQueue = positionQueue
         .then(async () => {
-          if (token === generation)
+          if (token === playback.token)
             updateSummary(
               await invoke<BookSummary>("save_position", nextPosition),
             );
         })
         .catch(report);
       await positionQueue;
-      if (token !== generation) return;
+      if (token !== playback.token) return;
       const next = await invoke<Book>("open_book", { id: current.id });
-      if (token !== generation) return;
+      if (token !== playback.token) return;
       book.value = next;
       active.value = 0;
       await jump();
     }
   } catch (e) {
-    if (token === generation) {
+    if (token === playback.token) {
       playing.value = false;
       paused.value = false;
       report(`Ошибка озвучки: ${audioErrorMessage(e)}`);
     }
   } finally {
-    if (token === generation) {
+    if (ownedAudio) releaseAudio(ownedAudio);
+    if (token === playback.token) {
       loopRunning = false;
       withdrawPlaybackInterest();
     }
@@ -889,7 +958,7 @@ async function play() {
 async function previewVoice() {
   if (closing.value || apiKeyBusy.value || modelSaving.value) return;
   stop();
-  const token = generation;
+  const token = playback.token;
   if (prefs.value.voice === "openrouter" && !openRouter.value.hasApiKey) {
     notice.value = "Добавьте ключ OpenRouter в настройках";
     return;
@@ -897,10 +966,10 @@ async function previewVoice() {
   preview.start(token);
   try {
     await savePrefsNow();
-    if (token !== generation) return;
+    if (token !== playback.token) return;
     await speak("Здравствуйте! Так звучит выбранный голос.", 1, token);
   } catch (e) {
-    if (token === generation) report(e);
+    if (token === playback.token) report(e);
   } finally {
     preview.finish(token);
   }
@@ -1013,7 +1082,7 @@ async function setBackground(clear = false) {
     if (closing.value) return;
     const updated = await invoke<Preferences>("set_background", { path });
     updated.openRouterBillingUnits = { ...prefs.value.openRouterBillingUnits };
-    prefs.value = updated;
+    prefs.value = normalizePreferences(defaults, updated);
   } catch (e) {
     report(e);
   }
@@ -1110,7 +1179,13 @@ async function restoreOfflineManifest(issue: OfflineDiagnostic) {
 }
 let offlinePolling = false;
 let offlinePollPending = false;
-const pausedPollDeadlines = new Map<string, number>();
+let offlineEventWhileBusy = false;
+watch(offlineBusy, (busy) => {
+  if (!busy && offlineEventWhileBusy) {
+    offlineEventWhileBusy = false;
+    void refreshOfflineStatuses();
+  }
+});
 async function refreshOfflineStatuses(isCurrent: () => boolean = () => true) {
   if (!native.value) return;
   if (offlinePolling) {
@@ -1118,7 +1193,6 @@ async function refreshOfflineStatuses(isCurrent: () => boolean = () => true) {
     return;
   }
   offlinePolling = true;
-  clearTimeout(statusTimer);
   try {
     const statuses = await invoke<OfflineStatus[]>("offline_list");
     if (!isCurrent() || closing.value || !mounted) return;
@@ -1158,26 +1232,10 @@ async function refreshOfflineStatuses(isCurrent: () => boolean = () => true) {
     }
   } finally {
     offlinePolling = false;
-    const now = Date.now();
-    for (const [bookId, deadline] of pausedPollDeadlines)
-      if (
-        deadline <= now ||
-        offlineStatuses.value[bookId]?.state === "complete"
-      )
-        pausedPollDeadlines.delete(bookId);
     if (offlinePollPending) {
       offlinePollPending = false;
       void refreshOfflineStatuses();
-    } else if (
-      shouldPollOffline(
-        Object.values(offlineStatuses.value),
-        pausedPollDeadlines,
-        now,
-      )
-    )
-      statusTimer = setTimeout(() => {
-        void refreshOfflineStatuses();
-      }, 2000);
+    }
   }
 }
 function saveSourceChoice() {
@@ -1251,7 +1309,8 @@ async function quoteOffline() {
           : "";
     }
   } catch (e) {
-    if (token === offlineDialogGeneration) offlineError.value = String(e);
+    if (token === offlineDialogGeneration)
+      offlineError.value = audioErrorMessage(e);
   } finally {
     if (token === offlineDialogGeneration) offlineBusy.value = false;
   }
@@ -1264,6 +1323,9 @@ async function showOfflineDialog(bookId: string) {
       : null;
   const openToken = ++offlineDialogGeneration;
   offlineRetryConfirmed.value = false;
+  maxNewBlocks.value = null;
+  maxCostUsd.value = "";
+  allowUnknownCost.value = false;
   offlineBookId.value = bookId;
   offlineDialog.value = true;
   await nextTick();
@@ -1321,7 +1383,8 @@ async function saveBillingUnit() {
         offlineInfo.value = "Единица сохранена. Проверьте обновлённую оценку.";
     }
   } catch (e) {
-    if (token === offlineDialogGeneration) offlineError.value = String(e);
+    if (token === offlineDialogGeneration)
+      offlineError.value = audioErrorMessage(e);
   } finally {
     if (token === offlineDialogGeneration) offlineBusy.value = false;
   }
@@ -1332,7 +1395,16 @@ async function startOffline() {
     !offlineQuote.value ||
     !offlineBookId.value ||
     offlineBusy.value ||
-    (offlineQuote.value.retryRequiredBlocks > 0 && !offlineRetryConfirmed.value)
+    (offlineQuote.value.retryRequiredBlocks > 0 &&
+      !offlineRetryConfirmed.value) ||
+    (offlineQuote.value.engine === "openrouter" &&
+      offlineQuote.value.totalBlocks > offlineQuote.value.cachedBlocks &&
+      (!maxNewBlocks.value ||
+        !Number.isSafeInteger(maxNewBlocks.value) ||
+        maxNewBlocks.value < 1 ||
+        (offlineQuote.value.costUnit === "unknown" &&
+          !allowUnknownCost.value))) ||
+    (offlineQuote.value.costUnit !== "unknown" && !validMaxCost.value)
   )
     return;
   const bookId = offlineBookId.value;
@@ -1345,9 +1417,16 @@ async function startOffline() {
       bookId,
       quoteId,
       confirmRetries: offlineRetryConfirmed.value,
+      budget: {
+        maxCostUsd:
+          offlineQuote.value?.costUnit === "unknown"
+            ? null
+            : maxCostUsd.value.trim() || null,
+        maxNewBlocks: maxNewBlocks.value || null,
+        allowUnknownCost: allowUnknownCost.value,
+      },
     });
     offlineStatuses.value[status.bookId] = status;
-    pausedPollDeadlines.delete(bookId);
     if (token === offlineDialogGeneration) {
       offlineQuote.value = null;
       offlineInfo.value = "";
@@ -1366,7 +1445,29 @@ async function startOffline() {
       )
         offlineInfo.value = "Расчёт обновлён. Проверьте его перед запуском.";
     } else if (token === offlineDialogGeneration)
-      offlineError.value = String(e);
+      offlineError.value = audioErrorMessage(e);
+  } finally {
+    if (token === offlineDialogGeneration) offlineBusy.value = false;
+  }
+}
+async function reconcileOfflineCost() {
+  if (!offlineBookId.value || offlineBusy.value) return;
+  const id = offlineBookId.value;
+  const token = offlineDialogGeneration;
+  offlineBusy.value = true;
+  offlineError.value = "";
+  try {
+    const status = await invoke<OfflineStatus>("reconcile_book_cost", {
+      bookId: id,
+    });
+    offlineStatuses.value[id] = status;
+    if (token === offlineDialogGeneration)
+      offlineInfo.value = status.unknownCostRequests
+        ? "Не все расходы ещё доступны у провайдера."
+        : "Расходы сверены с провайдером.";
+  } catch (error) {
+    if (token === offlineDialogGeneration)
+      offlineError.value = audioErrorMessage(error);
   } finally {
     if (token === offlineDialogGeneration) offlineBusy.value = false;
   }
@@ -1380,11 +1481,11 @@ async function pauseOffline() {
   try {
     const status = await invoke<OfflineStatus>("offline_pause", { bookId });
     offlineStatuses.value[status.bookId] = status;
-    pausedPollDeadlines.set(bookId, Date.now() + 65000);
     void refreshOfflineStatuses();
     if (token === offlineDialogGeneration) await quoteOffline();
   } catch (e) {
-    if (token === offlineDialogGeneration) offlineError.value = String(e);
+    if (token === offlineDialogGeneration)
+      offlineError.value = audioErrorMessage(e);
   } finally {
     if (token === offlineDialogGeneration) offlineBusy.value = false;
   }
@@ -1400,13 +1501,13 @@ async function removeOffline() {
     if (book.value?.id === bookId && offlineSource.value[bookId]) stop();
     await invoke("offline_remove", { bookId });
     delete offlineStatuses.value[bookId];
-    pausedPollDeadlines.delete(bookId);
     delete offlineSource.value[bookId];
     saveSourceChoice();
     audioLoader.clearBook(bookId);
     if (token === offlineDialogGeneration) await quoteOffline();
   } catch (e) {
-    if (token === offlineDialogGeneration) offlineError.value = String(e);
+    if (token === offlineDialogGeneration)
+      offlineError.value = audioErrorMessage(e);
   } finally {
     if (token === offlineDialogGeneration) offlineBusy.value = false;
   }
@@ -1499,7 +1600,7 @@ async function loadModels(refresh = false) {
       modelsLoaded.value = true;
     }
   } catch (e) {
-    if (epoch === modelCatalogEpoch) modelsError.value = String(e);
+    if (epoch === modelCatalogEpoch) modelsError.value = audioErrorMessage(e);
   } finally {
     modelsLoading.value = false;
     if (pendingModelRefresh) {
@@ -1515,18 +1616,102 @@ async function changeModel(event: Event) {
   if (id && !model) return;
   stop();
   modelSaving.value = true;
-  const selection = selectionForModel(model);
-  prefs.value.openRouterModel = selection.model;
-  prefs.value.openRouterVoice = null;
-  if (selection.model) prefs.value.voice = "openrouter";
+  const previous = {
+    model: prefs.value.openRouterModel,
+    voice: prefs.value.openRouterVoice,
+    engine: prefs.value.voice,
+    settings: prefs.value.openRouterModelSettings ?? {},
+  };
+  let committed = false;
   try {
+    const selection = selectionForModel(model);
+    prefs.value.openRouterModel = selection.model;
+    if (selection.model && model?.canonicalSlug) {
+      prefs.value.openRouterModelSettings = modelSettingsWithRevision(
+        prefs.value.openRouterModelSettings,
+        selection.model,
+        model.canonicalSlug,
+      );
+    }
+    prefs.value.openRouterVoice = null;
+    if (selection.model) prefs.value.voice = "openrouter";
     await savePrefsNow();
+    committed = true;
     if (selection.voice) {
       prefs.value.openRouterVoice = selection.voice;
       await savePrefsNow();
     }
   } catch (e) {
+    if (committed) {
+      prefs.value.openRouterVoice = null;
+    } else {
+      prefs.value.openRouterModel = previous.model;
+      prefs.value.openRouterVoice = previous.voice;
+      prefs.value.voice = previous.engine;
+      prefs.value.openRouterModelSettings = previous.settings;
+      (event.target as HTMLSelectElement).value = previous.model ?? "";
+    }
     report(e);
+  } finally {
+    modelSaving.value = false;
+  }
+}
+const modelTransport = ref<"mp3" | "pcm">("mp3");
+const pcmRate = ref<number | null>(null);
+const pcmChannels = ref<number | null>(null);
+const inputLimitUnit = ref<"" | "character" | "utf8_byte" | "xml_escaped_byte">(
+  "",
+);
+const inputLimitValue = ref<number | null>(null);
+watch(
+  () =>
+    [prefs.value.openRouterModel, prefs.value.openRouterModelSettings] as const,
+  ([model, settings]) => {
+    const current = model ? settings?.[model] : undefined;
+    modelTransport.value = current?.transport?.format ?? "mp3";
+    pcmRate.value = current?.transport?.pcmSampleRate ?? null;
+    pcmChannels.value = current?.transport?.pcmChannels ?? null;
+    inputLimitUnit.value = current?.inputLimit?.unit ?? "";
+    inputLimitValue.value = current?.inputLimit?.value ?? null;
+  },
+  { immediate: true },
+);
+async function saveModelSettings() {
+  const model = prefs.value.openRouterModel;
+  if (!model || modelSaving.value) return;
+  if (
+    inputLimitUnit.value &&
+    (!inputLimitValue.value || inputLimitValue.value < 1)
+  ) {
+    notice.value = "Укажите положительный лимит ввода модели";
+    return;
+  }
+  stop();
+  const previous = prefs.value.openRouterModelSettings ?? {};
+  prefs.value.openRouterModelSettings = {
+    ...previous,
+    [model]: modelSettingsWithLimit(
+      previous[model],
+      {
+        format: modelTransport.value,
+        pcmSampleRate: modelTransport.value === "pcm" ? pcmRate.value : null,
+        pcmChannels: modelTransport.value === "pcm" ? pcmChannels.value : null,
+      },
+      inputLimitUnit.value && inputLimitValue.value
+        ? {
+            unit: inputLimitUnit.value,
+            value: inputLimitValue.value,
+            source: "user",
+          }
+        : null,
+    ),
+  };
+  modelSaving.value = true;
+  try {
+    await savePrefsNow();
+  } catch (error) {
+    prefs.value.openRouterModelSettings = previous;
+    report(error);
   } finally {
     modelSaving.value = false;
   }
@@ -1578,6 +1763,7 @@ let shutdownPromise: Promise<void> | null = null;
 let mounted = false;
 let unlistenShutdown: (() => void) | undefined;
 let unlistenClose: (() => void) | undefined;
+let unlistenOffline: (() => void) | undefined;
 function flushForShutdown(): Promise<void> {
   if (shutdownPromise) return shutdownPromise;
   closing.value = true;
@@ -1639,6 +1825,18 @@ onMounted(async () => {
         return;
       }
       unlistenClose = removeClose;
+      const removeOffline = await listen<OfflineStatus>(
+        "offline-status-changed",
+        () => {
+          if (offlineBusy.value) offlineEventWhileBusy = true;
+          void refreshOfflineStatuses();
+        },
+      );
+      if (!mounted) {
+        removeOffline();
+        return;
+      }
+      unlistenOffline = removeOffline;
       const session = await invoke<string>("audio_session");
       if (!mounted || closing.value) return;
       playbackInterest = new PlaybackInterest(
@@ -1649,7 +1847,7 @@ onMounted(async () => {
       const state = await invoke<Bootstrap>("bootstrap");
       if (!mounted || closing.value) return;
       books.value = state.books;
-      prefs.value = state.preferences;
+      prefs.value = normalizePreferences(defaults, state.preferences);
       voices.value = state.voices;
       openRouter.value = state.openRouter;
       notice.value = state.warnings.join("\n");
@@ -1676,7 +1874,7 @@ onBeforeUnmount(() => {
   mounted = false;
   unlistenShutdown?.();
   unlistenClose?.();
-  clearTimeout(statusTimer);
+  unlistenOffline?.();
   stop();
   void savePrefsNow().catch(() => {});
 });
@@ -1932,7 +2130,14 @@ onBeforeUnmount(() => {
               /></span>
               <span class="player-book-info"
                 ><strong>{{ book.title }}</strong
-                ><small>{{ book.author }}</small></span
+                ><small
+                  >{{ book.author }} ·
+                  {{
+                    accurateTransitions
+                      ? "Метки провайдера"
+                      : "Переходы по тексту приблизительные"
+                  }}</small
+                ></span
               >
             </div>
             <div class="controls">
@@ -1973,8 +2178,7 @@ onBeforeUnmount(() => {
               </div>
               <label class="player-slider" title="Скорость"
                 ><span>{{ book.speed.toFixed(1) }}×</span
-                ><input
-                  type="range"
+                ><RangeInput
                   min="0.5"
                   max="3"
                   step="0.1"
@@ -1983,8 +2187,7 @@ onBeforeUnmount(() => {
                   @input="changeSpeed"
               /></label>
               <label class="player-slider volume-slider" title="Громкость"
-                ><Volume2 aria-hidden="true" /><input
-                  type="range"
+                ><Volume2 aria-hidden="true" /><RangeInput
                   min="0"
                   max="1"
                   step="0.05"
@@ -2068,9 +2271,9 @@ onBeforeUnmount(() => {
               type="checkbox"
               @change="savePrefs" /></label
           ><label v-if="prefs.backgroundBlurEnabled" class="setting"
-            >Сила размытия · {{ Math.round(prefs.backgroundBlur * 100) }}%<input
+            >Сила размытия ·
+            {{ Math.round(prefs.backgroundBlur * 100) }}%<RangeInput
               v-model.number="prefs.backgroundBlur"
-              type="range"
               min="0"
               max="1"
               step="0.05"
@@ -2080,8 +2283,7 @@ onBeforeUnmount(() => {
             :src="background"
             alt="Фоновое изображение" /><label class="setting"
             >Прозрачность фото ·
-            {{ Math.round((1 - prefs.backgroundOpacity) * 100) }}%<input
-              type="range"
+            {{ Math.round((1 - prefs.backgroundOpacity) * 100) }}%<RangeInput
               min="0.15"
               max="0.95"
               step="0.05"
@@ -2093,18 +2295,16 @@ onBeforeUnmount(() => {
               " /></label
           ><label class="setting"
             >Затемнение фото ·
-            {{ Math.round(prefs.backgroundDim * 100) }}%<input
+            {{ Math.round(prefs.backgroundDim * 100) }}%<RangeInput
               v-model.number="prefs.backgroundDim"
-              type="range"
               min="0"
               max="0.8"
               step="0.05"
               @input="savePrefs" /></label
           ><label class="setting"
             >Прозрачность панелей ·
-            {{ Math.round(prefs.surfaceTransparency * 100) }}%<input
+            {{ Math.round(prefs.surfaceTransparency * 100) }}%<RangeInput
               v-model.number="prefs.surfaceTransparency"
-              type="range"
               min="0"
               max="0.75"
               step="0.05"
@@ -2112,18 +2312,16 @@ onBeforeUnmount(() => {
         ></template>
         <label class="setting"
           >Размер текста · {{ Math.round(prefs.fontSize)
-          }}<input
+          }}<RangeInput
             v-model.number="prefs.fontSize"
-            type="range"
             min="14"
             max="32"
             step="1"
             @input="savePrefs" /></label
         ><label class="setting"
           >Межстрочный интервал · {{ Number(prefs.lineHeight.toFixed(2))
-          }}<input
+          }}<RangeInput
             v-model.number="prefs.lineHeight"
-            type="range"
             min="1.2"
             max="2.2"
             step="0.05"
@@ -2288,6 +2486,73 @@ onBeforeUnmount(() => {
               :disabled="!native || modelSaving"
               @input="changeOpenRouterVoice"
           /></label>
+          <form
+            v-if="prefs.openRouterModel"
+            class="model-settings"
+            @submit.prevent="saveModelSettings"
+          >
+            <strong>Формат и лимит модели</strong>
+            <label class="model-settings-format"
+              >Формат аудио<select
+                v-model="modelTransport"
+                :disabled="modelSaving"
+              >
+                <option value="mp3">MP3</option>
+                <option value="pcm">PCM</option>
+              </select></label
+            >
+            <template v-if="modelTransport === 'pcm'">
+              <label
+                >Частота PCM, Гц<input
+                  v-model.number="pcmRate"
+                  type="number"
+                  min="1"
+                  step="1"
+                  :disabled="modelSaving"
+              /></label>
+              <label
+                >Каналы PCM<input
+                  v-model.number="pcmChannels"
+                  type="number"
+                  min="1"
+                  step="1"
+                  :disabled="modelSaving"
+              /></label>
+              <small
+                >Если ответ не содержит характеристики PCM, укажите частоту и
+                число каналов.</small
+              >
+            </template>
+            <label
+              >Единица лимита ввода<select
+                v-model="inputLimitUnit"
+                :disabled="modelSaving"
+              >
+                <option value="">Не указан</option>
+                <option value="character">Символы</option>
+                <option value="utf8_byte">Байты UTF-8</option>
+                <option value="xml_escaped_byte">
+                  Байты после XML-экранирования
+                </option>
+              </select></label
+            >
+            <label v-if="inputLimitUnit"
+              >Лимит ввода<input
+                v-model.number="inputLimitValue"
+                type="number"
+                min="1"
+                step="1"
+                required
+                :disabled="modelSaving"
+            /></label>
+            <small
+              >Укажите лимит по документации модели. Изменение формата или
+              лимита пересоздаёт профиль аудио.</small
+            >
+            <button class="tonal" type="submit" :disabled="modelSaving">
+              Сохранить параметры модели
+            </button>
+          </form>
           <small
             >Без ID используется голос модели по умолчанию. Выберите OpenRouter
             в общем списке голосов ниже.</small
@@ -2483,6 +2748,44 @@ onBeforeUnmount(() => {
                 }"
               />
             </div>
+            <p
+              v-if="offlineStatuses[offlineBookId]?.pendingRequests"
+              class="warning"
+            >
+              Отправленных запросов в работе:
+              {{ offlineStatuses[offlineBookId]?.pendingRequests }}. Их
+              результат может сохраниться после паузы.
+            </p>
+            <p v-if="offlineStatuses[offlineBookId]?.submittedRequests">
+              Запросов по этой книге:
+              {{ offlineStatuses[offlineBookId]?.submittedRequests }}. Расход по
+              данным провайдера:
+              {{
+                offlineStatuses[offlineBookId]?.actualCostUsd === null
+                  ? "неизвестен"
+                  : `$${offlineStatuses[offlineBookId]?.actualCostUsd}`
+              }}. Оценочный резерв:
+              {{
+                offlineStatuses[offlineBookId]?.estimatedReservedUsd === null
+                  ? "неизвестен"
+                  : `$${offlineStatuses[offlineBookId]?.estimatedReservedUsd}`
+              }}.
+              <template
+                v-if="offlineStatuses[offlineBookId]?.unknownCostRequests"
+                >Запросов с неизвестной стоимостью:
+                {{
+                  offlineStatuses[offlineBookId]?.unknownCostRequests
+                }}.</template
+              >
+            </p>
+            <button
+              v-if="offlineStatuses[offlineBookId]?.unknownCostRequests"
+              class="tonal"
+              :disabled="offlineBusy"
+              @click="reconcileOfflineCost"
+            >
+              Сверить расходы
+            </button>
             <p v-if="offlineStatuses[offlineBookId]?.error" class="warning">
               {{ offlineStatuses[offlineBookId]?.error }}
             </p>
@@ -2593,7 +2896,56 @@ onBeforeUnmount(() => {
               Я согласен на повторную генерацию и возможное дополнительное
               списание
             </label>
-            <p>Переходы внутри аудиофрагмента приблизительные.</p>
+            <div
+              v-if="offlineQuote.engine === 'openrouter'"
+              class="billing-unit"
+            >
+              <label
+                >Максимум новых блоков<input
+                  v-model.number="maxNewBlocks"
+                  type="number"
+                  min="1"
+                  step="1"
+                  :disabled="offlineBusy"
+              /></label>
+              <label
+                >Ориентировочный предел расходов, USD (необязательно)<input
+                  v-model="maxCostUsd"
+                  type="text"
+                  inputmode="decimal"
+                  pattern="[0-9]+([.][0-9]+)?"
+                  :disabled="
+                    offlineBusy || offlineQuote.costUnit === 'unknown'
+                  "
+              /></label>
+              <small
+                v-if="!validMaxCost && offlineQuote.costUnit !== 'unknown'"
+                class="warning"
+                >Укажите сумму цифрами с точкой, например 0.25.</small
+              >
+              <small
+                >Предел расходов проверяется до следующего запроса; стоимость
+                уже отправленного запроса может его превысить.</small
+              >
+              <label v-if="offlineQuote.costUnit === 'unknown'"
+                ><input
+                  v-model="allowUnknownCost"
+                  type="checkbox"
+                  :disabled="offlineBusy"
+                />
+                Разрешить ограниченное число блоков при неизвестной
+                стоимости</label
+              >
+              <small v-if="offlineQuote.costUnit === 'unknown'"
+                >Без данных о фактических расходах следующий платный блок не
+                запускается; предел в USD не гарантирует итоговое
+                списание.</small
+              >
+            </div>
+            <p>
+              Без меток провайдера переходы внутри аудиофрагмента
+              приблизительные.
+            </p>
             <p v-if="offlineQuote.estimateSource === 'user'">
               Оценка рассчитана по единице, указанной вами; фактическое списание
               может отличаться.
@@ -2621,6 +2973,18 @@ onBeforeUnmount(() => {
               Тариф API, USD: вход
               {{ offlineQuote.pricing.prompt || "не указан" }}, выход
               {{ offlineQuote.pricing.completion || "не указан" }}.
+              <template
+                v-if="
+                  offlineQuote.pricingSource === 'openrouter_api' &&
+                  offlineQuote.pricingVerifiedAt
+                "
+                >Получен из OpenRouter
+                {{
+                  new Date(offlineQuote.pricingVerifiedAt).toLocaleString(
+                    "ru-RU",
+                  )
+                }}.</template
+              >
             </p>
             <div
               v-if="
@@ -2662,6 +3026,14 @@ onBeforeUnmount(() => {
               :disabled="
                 offlineBusy ||
                 billingDirty ||
+                (offlineQuote.costUnit !== 'unknown' && !validMaxCost) ||
+                (offlineQuote.engine === 'openrouter' &&
+                  offlineQuote.totalBlocks > offlineQuote.cachedBlocks &&
+                  (!maxNewBlocks ||
+                    !Number.isSafeInteger(maxNewBlocks) ||
+                    maxNewBlocks < 1 ||
+                    (offlineQuote.costUnit === 'unknown' &&
+                      !allowUnknownCost))) ||
                 (offlineQuote.retryRequiredBlocks > 0 && !offlineRetryConfirmed)
               "
               @click="startOffline"

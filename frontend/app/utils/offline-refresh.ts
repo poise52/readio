@@ -1,15 +1,7 @@
 import type { OfflineQuote, OfflineStatus } from "../types/models";
+import type { IpcErrorCode } from "../types/ipc";
 
-export function shouldPollOffline(
-  statuses: OfflineStatus[],
-  pausedDeadlines: ReadonlyMap<string, number>,
-  now: number,
-): boolean {
-  return (
-    statuses.some((status) => status.state === "running") ||
-    [...pausedDeadlines.values()].some((deadline) => deadline > now)
-  );
-}
+const staleQuote: IpcErrorCode = "stale_quote";
 
 export function shouldRefreshPausedQuote(
   status: OfflineStatus | undefined,
@@ -27,5 +19,10 @@ export function shouldRefreshPausedQuote(
 }
 
 export function isStaleQuoteError(error: unknown): boolean {
-  return String(error).includes("запросите оценку снова");
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === staleQuote
+  );
 }
