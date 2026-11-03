@@ -874,6 +874,11 @@ async fn piper(
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
+    let audio = piper_exchange(command, text).await?;
+    pcm_to_wav(&audio, sample_rate)
+}
+
+async fn piper_exchange(mut command: Command, text: &str) -> Result<Vec<u8>, SpeechError> {
     let mut child = command
         .spawn()
         .map_err(|error| SpeechError::Engine(format!("не удалось запустить Piper: {error}")))?;
@@ -886,9 +891,10 @@ async fn piper(
         .take()
         .ok_or_else(|| SpeechError::Engine("Piper не открыл stdout".into()))?;
     let single_line = text.replace(['\r', '\n'], " ");
-    let write_input = async {
+    let write_input = async move {
         stdin.write_all(single_line.as_bytes()).await?;
-        stdin.shutdown().await
+        drop(stdin);
+        Ok::<(), std::io::Error>(())
     };
     let read_audio = async {
         let mut audio = Vec::new();
@@ -917,7 +923,7 @@ async fn piper(
             "Piper не создал PCM (код: {status})"
         )));
     }
-    pcm_to_wav(&audio, sample_rate)
+    Ok(audio)
 }
 
 fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Result<Vec<u8>, SpeechError> {
@@ -944,6 +950,45 @@ fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Result<Vec<u8>, SpeechError> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    const PIPER_EOF_CHILD: &str = "READIO_TEST_PIPER_EOF_CHILD";
+    const PIPER_EOF_PCM: &[u8] = b"\x01\x02\x03\x04";
+
+    #[test]
+    fn piper_eof_child() {
+        use std::io::Write as _;
+        if std::env::var_os(PIPER_EOF_CHILD).is_none() {
+            return;
+        }
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input).unwrap();
+        if input != "Привет Мир".as_bytes() {
+            std::process::exit(2);
+        }
+        std::io::stdout().write_all(PIPER_EOF_PCM).unwrap();
+        std::io::stdout().flush().unwrap();
+        std::process::exit(0);
+    }
+
+    #[tokio::test]
+    async fn piper_closes_stdin_after_writing_to_allow_eof() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::piper_eof_child", "--nocapture"])
+            .env(PIPER_EOF_CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let audio = timeout(
+            Duration::from_secs(3),
+            piper_exchange(command, "Привет\nМир"),
+        )
+        .await
+        .expect("Piper did not receive EOF")
+        .unwrap();
+        assert!(audio.ends_with(PIPER_EOF_PCM));
+    }
+
     #[test]
     fn discovers_piper_config_locale_and_detects_resource_replacement() {
         let root =

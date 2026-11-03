@@ -1,4 +1,4 @@
-use crate::{Book, Chapter, Error, Preferences, Result, split_passages};
+use crate::{Book, Chapter, Error, Preferences, Result};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -464,6 +464,102 @@ fn finish_block(
     texts.clear();
 }
 
+const MAX_PLANNED_BLOCKS: usize = 8_192;
+const MAX_PLANNED_PARTS: usize = 32_768;
+const MAX_PLAN_OWNED_BYTES: usize = 24 * 1024 * 1024;
+const MAX_PLAN_CHAPTERS: usize = 4_096;
+
+#[derive(Default)]
+pub struct PlanningBudget {
+    blocks: usize,
+    parts: usize,
+    owned_bytes: usize,
+    chapters: usize,
+}
+
+impl PlanningBudget {
+    pub(crate) fn chapter(&mut self, title: &str) -> Result<()> {
+        self.chapters = self.chapters.checked_add(1).ok_or_else(plan_limit)?;
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_add(256)
+            .and_then(|n| n.checked_add(title.len().saturating_mul(2)))
+            .ok_or_else(plan_limit)?;
+        self.check()
+    }
+    fn block(&mut self, parts: usize, text_bytes: usize) -> Result<()> {
+        self.blocks = self.blocks.checked_add(1).ok_or_else(plan_limit)?;
+        self.parts = self.parts.checked_add(parts).ok_or_else(plan_limit)?;
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_add(512)
+            .and_then(|n| n.checked_add(parts.saturating_mul(128)))
+            .and_then(|n| n.checked_add(text_bytes.saturating_mul(2)))
+            .ok_or_else(plan_limit)?;
+        self.check()
+    }
+    fn check(&self) -> Result<()> {
+        if self.blocks > MAX_PLANNED_BLOCKS
+            || self.parts > MAX_PLANNED_PARTS
+            || self.owned_bytes > MAX_PLAN_OWNED_BYTES
+            || self.chapters > MAX_PLAN_CHAPTERS
+        {
+            Err(plan_limit())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn plan_limit() -> Error {
+    Error::Format("План озвучивания превышает лимит памяти приложения".into())
+}
+
+fn finish_checked(
+    result: &mut Vec<AudioBlock>,
+    chapter: usize,
+    profile: &AudioProfile,
+    parts: &mut Vec<AudioPart>,
+    texts: &mut Vec<String>,
+    budget: &mut PlanningBudget,
+) -> Result<()> {
+    if parts.is_empty() {
+        return Ok(());
+    }
+    let text_bytes = texts
+        .iter()
+        .try_fold(0_usize, |sum, text| sum.checked_add(text.len()))
+        .and_then(|sum| sum.checked_add(texts.len().saturating_sub(1).saturating_mul(2)))
+        .ok_or_else(plan_limit)?;
+    budget.block(parts.len(), text_bytes)?;
+    finish_block(result, chapter, profile, parts, texts, false);
+    Ok(())
+}
+
+fn finish_optional_budget(
+    result: &mut Vec<AudioBlock>,
+    chapter: usize,
+    profile: &AudioProfile,
+    parts: &mut Vec<AudioPart>,
+    texts: &mut Vec<String>,
+    legacy: bool,
+    budget: &mut Option<&mut PlanningBudget>,
+) -> Result<()> {
+    if parts.is_empty() {
+        return Ok(());
+    }
+    if let Some(budget) = budget {
+        let text_bytes = texts
+            .iter()
+            .try_fold(0_usize, |sum, text| sum.checked_add(text.len()))
+            .and_then(|sum| sum.checked_add(texts.len().saturating_sub(1).saturating_mul(2)))
+            .ok_or_else(plan_limit)?;
+        budget.block(parts.len(), text_bytes)?;
+    }
+    finish_block(result, chapter, profile, parts, texts, legacy);
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ChapterPlanner {
     profile: AudioProfile,
@@ -523,6 +619,24 @@ impl ChapterPlanner {
         self.try_plan_text(chapter, &source.text)
     }
 
+    pub(crate) fn try_plan_chapter_budgeted(
+        &self,
+        chapter: usize,
+        source: &Chapter,
+        budget: &mut PlanningBudget,
+    ) -> Result<Vec<AudioBlock>> {
+        self.try_plan_text_budgeted(chapter, &source.text, budget)
+    }
+
+    pub(crate) fn try_plan_v1_chapter_budgeted(
+        &self,
+        chapter: usize,
+        source: &Chapter,
+        budget: &mut PlanningBudget,
+    ) -> Result<Vec<AudioBlock>> {
+        self.plan_impl_budgeted(chapter, &source.text, true, Some(budget))
+    }
+
     /// Bounds legacy pronunciation expansion before invoking the frozen v1 planner.
     ///
     /// # Errors
@@ -536,7 +650,7 @@ impl ChapterPlanner {
         if self.rules.is_empty() {
             return Ok(());
         }
-        for passage in split_passages(text) {
+        for passage in crate::model::passage_iter(text) {
             prepare_units_checked(&passage.text, passage.start, &self.rules, true)?;
         }
         Ok(())
@@ -548,6 +662,16 @@ impl ChapterPlanner {
     /// Returns an error when source, dictionary expansion, or one replacement cannot fit.
     #[allow(clippy::too_many_lines)] // Keep sizing and source mapping in one bounded pass.
     pub fn try_plan_text(&self, chapter: usize, text: &str) -> Result<Vec<AudioBlock>> {
+        self.try_plan_text_budgeted(chapter, text, &mut PlanningBudget::default())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn try_plan_text_budgeted(
+        &self,
+        chapter: usize,
+        text: &str,
+        budget: &mut PlanningBudget,
+    ) -> Result<Vec<AudioBlock>> {
         if text.len() > MAX_PLANNING_SOURCE_BYTES {
             return Err(Error::Format(
                 "Глава превышает допустимый размер планирования".into(),
@@ -563,7 +687,7 @@ impl ChapterPlanner {
         let mut texts = Vec::new();
         let mut app_size = 0_usize;
         let mut provider_size = 0_usize;
-        for (index, passage) in split_passages(text).iter().enumerate() {
+        for (index, passage) in crate::model::passage_iter(text).enumerate() {
             let mut current = String::new();
             let mut start = 0;
             let mut end = 0;
@@ -641,14 +765,14 @@ impl ChapterPlanner {
                                 parts.push(prepared_part(index, start, end, &current, &texts));
                                 texts.push(std::mem::take(&mut current));
                             }
-                            finish_block(
+                            finish_checked(
                                 &mut blocks,
                                 chapter,
                                 &self.profile,
                                 &mut parts,
                                 &mut texts,
-                                false,
-                            );
+                                budget,
+                            )?;
                             app_size = 0;
                             provider_size = 0;
                         }
@@ -685,14 +809,14 @@ impl ChapterPlanner {
                             parts.push(prepared_part(index, start, end, &current, &texts));
                             texts.push(std::mem::take(&mut current));
                         }
-                        finish_block(
+                        finish_checked(
                             &mut blocks,
                             chapter,
                             &self.profile,
                             &mut parts,
                             &mut texts,
-                            false,
-                        );
+                            budget,
+                        )?;
                         app_size = 0;
                         provider_size = 0;
                     }
@@ -717,14 +841,14 @@ impl ChapterPlanner {
                 texts.push(current);
             }
         }
-        finish_block(
+        finish_checked(
             &mut blocks,
             chapter,
             &self.profile,
             &mut parts,
             &mut texts,
-            false,
-        );
+            budget,
+        )?;
         blocks.retain(|block| !block.text.trim().is_empty());
         Ok(blocks)
     }
@@ -749,56 +873,83 @@ impl ChapterPlanner {
     }
 
     fn plan_impl(&self, chapter: usize, text: &str, legacy: bool) -> Vec<AudioBlock> {
+        self.plan_impl_budgeted(chapter, text, legacy, None)
+            .unwrap_or_default()
+    }
+
+    fn plan_impl_budgeted(
+        &self,
+        chapter: usize,
+        text: &str,
+        legacy: bool,
+        mut budget: Option<&mut PlanningBudget>,
+    ) -> Result<Vec<AudioBlock>> {
         let limit = self.profile.escaped_byte_limit();
         let mut blocks = Vec::new();
         let mut parts = Vec::new();
         let mut texts = Vec::new();
         let mut bytes = 0;
-        for (index, passage) in split_passages(text).iter().enumerate() {
-            let units = prepare_units(&passage.text, passage.start, &self.rules);
+        for (index, passage) in crate::model::passage_iter(text).enumerate() {
             let mut current = String::new();
             let mut start = 0;
             let mut end = 0;
-            for unit in units {
-                let separator = if current.is_empty() && !parts.is_empty() {
-                    2
+            let mut remaining = passage.text.as_str();
+            let mut source_offset = passage.start;
+            while !remaining.is_empty() {
+                let end_byte = if self.rules.is_empty() {
+                    remaining
+                        .char_indices()
+                        .nth(MAX_PREPARED_UNITS)
+                        .map_or(remaining.len(), |(byte, _)| byte)
                 } else {
-                    0
+                    remaining.len()
                 };
-                let size = escaped_size(unit.ch);
-                if bytes + separator + size > limit
-                    || current.is_empty() && parts.len() >= AUDIO_BLOCK_MAX_PASSAGES
-                {
-                    if !current.is_empty() {
-                        parts.push(AudioPart {
-                            index,
-                            start,
-                            end,
-                            weight: weight(&current),
-                            synthesis_start: None,
-                            synthesis_end: None,
-                        });
-                        texts.push(std::mem::take(&mut current));
+                let chunk = &remaining[..end_byte];
+                let units = prepare_units(chunk, source_offset, &self.rules);
+                for unit in units {
+                    let separator = if current.is_empty() && !parts.is_empty() {
+                        2
+                    } else {
+                        0
+                    };
+                    let size = escaped_size(unit.ch);
+                    if bytes + separator + size > limit
+                        || current.is_empty() && parts.len() >= AUDIO_BLOCK_MAX_PASSAGES
+                    {
+                        if !current.is_empty() {
+                            parts.push(AudioPart {
+                                index,
+                                start,
+                                end,
+                                weight: weight(&current),
+                                synthesis_start: None,
+                                synthesis_end: None,
+                            });
+                            texts.push(std::mem::take(&mut current));
+                        }
+                        finish_optional_budget(
+                            &mut blocks,
+                            chapter,
+                            &self.profile,
+                            &mut parts,
+                            &mut texts,
+                            legacy,
+                            &mut budget,
+                        )?;
+                        bytes = 0;
                     }
-                    finish_block(
-                        &mut blocks,
-                        chapter,
-                        &self.profile,
-                        &mut parts,
-                        &mut texts,
-                        legacy,
-                    );
-                    bytes = 0;
-                }
-                if current.is_empty() {
-                    if !parts.is_empty() {
-                        bytes += 2;
+                    if current.is_empty() {
+                        if !parts.is_empty() {
+                            bytes += 2;
+                        }
+                        start = unit.start;
                     }
-                    start = unit.start;
+                    bytes += size;
+                    end = unit.end;
+                    current.push(unit.ch);
                 }
-                bytes += size;
-                end = unit.end;
-                current.push(unit.ch);
+                source_offset += chunk.encode_utf16().count();
+                remaining = &remaining[end_byte..];
             }
             if !current.is_empty() {
                 parts.push(AudioPart {
@@ -812,16 +963,17 @@ impl ChapterPlanner {
                 texts.push(current);
             }
         }
-        finish_block(
+        finish_optional_budget(
             &mut blocks,
             chapter,
             &self.profile,
             &mut parts,
             &mut texts,
             legacy,
-        );
+            &mut budget,
+        )?;
         blocks.retain(|block| block.text.chars().any(char::is_alphanumeric));
-        blocks
+        Ok(blocks)
     }
 }
 
@@ -2003,6 +2155,65 @@ mod tests {
                 .try_plan_text(0, "😀")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn tiny_model_limit_stops_before_allocating_unbounded_block_count() {
+        let mut profile = AudioProfile::from_preferences(&Preferences::default());
+        profile.synthesis = Some(SynthesisSettings {
+            input_limit: Some(InputLimit {
+                unit: InputUnit::Character,
+                value: 1,
+                source: LimitSource::User,
+                verified_at: None,
+            }),
+            ..SynthesisSettings::default()
+        });
+        let planner = ChapterPlanner::try_new(&profile).unwrap();
+        let mut budget = PlanningBudget::default();
+        assert!(
+            planner
+                .try_plan_text_budgeted(0, &"x".repeat(100_000), &mut budget)
+                .is_err()
+        );
+        assert_eq!(budget.blocks, MAX_PLANNED_BLOCKS + 1);
+        assert!(budget.owned_bytes < MAX_PLAN_OWNED_BYTES);
+    }
+
+    #[test]
+    fn legacy_v1_chunk_boundary_keeps_original_ids_and_offsets() {
+        let profile = AudioProfile::from_preferences(&Preferences::default());
+        let input = "a".repeat(MAX_PREPARED_UNITS + 1);
+        let planned = plan_chapter_v1(&book(&input), 0, &profile);
+        let expected_id = canonical_block_id(&"a".repeat(AUDIO_BLOCK_MAX_ESCAPED_BYTES), &profile);
+        assert_eq!(planned[0].id, expected_id);
+        assert_eq!(
+            (planned[0].start, planned[0].end),
+            (0, AUDIO_BLOCK_MAX_ESCAPED_BYTES)
+        );
+        assert_eq!(planned.last().unwrap().end, input.len());
+        assert!(planned.iter().all(|block| {
+            block
+                .passages
+                .iter()
+                .all(|part| part.synthesis_start.is_none())
+        }));
+    }
+
+    #[test]
+    fn expanding_dictionary_is_limited_during_block_emission() {
+        let mut profile = AudioProfile::from_preferences(&Preferences::default());
+        profile.max_escaped_bytes = Some(6);
+        profile.dictionary.insert("x".into(), "yy".into());
+        let planner = ChapterPlanner::try_new(&profile).unwrap();
+        let mut budget = PlanningBudget::default();
+        assert!(
+            planner
+                .try_plan_text_budgeted(0, &"x ".repeat(MAX_PLANNED_BLOCKS * 3), &mut budget)
+                .is_err()
+        );
+        assert!(budget.blocks <= MAX_PLANNED_BLOCKS + 1);
+        assert!(budget.owned_bytes <= MAX_PLAN_OWNED_BYTES);
     }
 
     #[test]

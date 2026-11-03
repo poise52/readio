@@ -28,7 +28,7 @@ struct AppState {
     store: Arc<Mutex<Store>>,
     speech: SpeechService,
     offline: Arc<offline::OfflineManager>,
-    openrouter_catalog: tokio::sync::Mutex<Option<CachedCatalog>>,
+    openrouter_catalog: Arc<tokio::sync::Mutex<Option<CachedCatalog>>>,
     audio_resources: Arc<audio_resource::AudioResources>,
 }
 struct CachedCatalog {
@@ -86,12 +86,45 @@ async fn catalog(
     Ok((models, api_key))
 }
 type IpcResult<T> = Result<T, String>;
-fn with_store<T>(
+async fn with_store<T: Send + 'static>(
     state: &State<'_, AppState>,
-    f: impl FnOnce(&Store) -> desk_core::Result<T>,
+    mode: StoreAccess,
+    f: impl FnOnce(&Store) -> desk_core::Result<T> + Send + 'static,
 ) -> IpcResult<T> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
-    f(&store).map_err(|e| e.to_string())
+    let store = Arc::clone(&state.store);
+    let permit = match mode {
+        StoreAccess::Read => None,
+        StoreAccess::Mutation => Some(state.offline.mutation_permit()?),
+        StoreAccess::FinalSave => Some(state.offline.final_save_permit()?),
+    };
+    execute_store(store, permit, f).await
+}
+async fn execute_store<T: Send + 'static>(
+    store: Arc<Mutex<Store>>,
+    permit: Option<tasks::TaskPermit>,
+    f: impl FnOnce(&Store) -> desk_core::Result<T> + Send + 'static,
+) -> IpcResult<T> {
+    execute_store_with_start(store, permit, f, || {}).await
+}
+async fn execute_store_with_start<T: Send + 'static>(
+    store: Arc<Mutex<Store>>,
+    permit: Option<tasks::TaskPermit>,
+    f: impl FnOnce(&Store) -> desk_core::Result<T> + Send + 'static,
+    on_start: impl FnOnce() + Send + 'static,
+) -> IpcResult<T> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        on_start();
+        let store = store.lock().map_err(|e| e.to_string())?;
+        f(&store).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+enum StoreAccess {
+    Read,
+    Mutation,
+    FinalSave,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,7 +145,9 @@ struct OpenRouterStatus {
 async fn bootstrap(state: State<'_, AppState>) -> Result<Bootstrap, crate::ipc::IpcError> {
     let result: IpcResult<_> = async {
         let store = Arc::clone(&state.store);
+        let permit = state.offline.mutation_permit()?;
         let (books, preferences) = tauri::async_runtime::spawn_blocking(move || {
+            let _permit = permit;
             let store = store.lock().map_err(|e| e.to_string())?;
             let mut preferences = store.preferences().map_err(|e| e.to_string())?;
             if migrate_provider(&mut preferences) {
@@ -154,7 +189,9 @@ async fn import_books(
     let result: IpcResult<_> = async {
         let store = Arc::clone(&state.store);
         let offline = Arc::clone(&state.offline);
+        let permit = offline.mutation_permit()?;
         tauri::async_runtime::spawn_blocking(move || {
+            let _permit = permit;
             let store = store.lock().map_err(|e| e.to_string())?;
             let result = store.import(&paths).map_err(|e| e.to_string());
             offline.invalidate_plans();
@@ -191,19 +228,30 @@ async fn open_book(
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned command arguments.
 async fn delete_book(state: State<'_, AppState>, id: String) -> Result<(), crate::ipc::IpcError> {
     let result: IpcResult<_> = async {
-        state.offline.remove_all(&id).await?;
-        let store = state.store.lock().map_err(|e| e.to_string())?;
-        let result = store.delete(&id).map_err(|e| e.to_string());
-        state.offline.invalidate_plans();
-        drop(store);
-        result
+        let offline = Arc::clone(&state.offline);
+        let manager = Arc::clone(&offline);
+        let store = Arc::clone(&state.store);
+        offline
+            .run_mutation(async move {
+                manager.remove_all(&id).await?;
+                tauri::async_runtime::spawn_blocking(move || {
+                    let store = store.lock().map_err(|e| e.to_string())?;
+                    let result = store.delete(&id).map_err(|e| e.to_string());
+                    manager.invalidate_plans();
+                    drop(store);
+                    result
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            })
+            .await
     }
     .await;
     result.map_err(Into::into)
 }
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned command arguments.
-fn save_position(
+async fn save_position(
     state: State<'_, AppState>,
     id: String,
     chapter: usize,
@@ -211,45 +259,54 @@ fn save_position(
     speed: f32,
     audio_position: Option<desk_core::AudioPosition>,
 ) -> Result<BookSummary, crate::ipc::IpcError> {
-    let result: IpcResult<_> = with_store(&state, |s| {
+    let result: IpcResult<_> = with_store(&state, StoreAccess::FinalSave, move |s| {
         s.position_with_audio(&id, chapter, offset, speed, audio_position.as_ref())
-    });
+    })
+    .await;
     result.map_err(Into::into)
 }
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned command arguments.
-fn add_bookmark(
+async fn add_bookmark(
     state: State<'_, AppState>,
     id: String,
     chapter: usize,
     offset: usize,
 ) -> Result<Mark, crate::ipc::IpcError> {
-    let result: IpcResult<_> = with_store(&state, |s| s.add_mark(&id, chapter, offset));
+    let result: IpcResult<_> = with_store(&state, StoreAccess::Mutation, move |s| {
+        s.add_mark(&id, chapter, offset)
+    })
+    .await;
     result.map_err(Into::into)
 }
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned command arguments.
-fn list_bookmarks(state: State<'_, AppState>) -> Result<Vec<BookmarkEntry>, crate::ipc::IpcError> {
-    let result: IpcResult<_> = with_store(&state, Store::bookmarks);
+async fn list_bookmarks(
+    state: State<'_, AppState>,
+) -> Result<Vec<BookmarkEntry>, crate::ipc::IpcError> {
+    let result: IpcResult<_> = with_store(&state, StoreAccess::Read, Store::bookmarks).await;
     result.map_err(Into::into)
 }
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned command arguments.
-fn delete_bookmark(
+async fn delete_bookmark(
     state: State<'_, AppState>,
     id: String,
     mark_id: String,
 ) -> Result<(), crate::ipc::IpcError> {
-    let result: IpcResult<_> = with_store(&state, |s| s.delete_mark(&id, &mark_id));
+    let result: IpcResult<_> = with_store(&state, StoreAccess::Mutation, move |s| {
+        s.delete_mark(&id, &mark_id)
+    })
+    .await;
     result.map_err(Into::into)
 }
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned command arguments.
-fn save_preferences(
+async fn save_preferences(
     state: State<'_, AppState>,
     preferences: Preferences,
 ) -> Result<Preferences, crate::ipc::IpcError> {
-    let result: IpcResult<_> = with_store(&state, |store| {
+    let result: IpcResult<_> = with_store(&state, StoreAccess::FinalSave, move |store| {
         let previous = store.preferences()?;
         let mut preferences = preferences;
         preferences.open_router_billing_units = previous.open_router_billing_units.clone();
@@ -258,7 +315,8 @@ fn save_preferences(
             preferences.open_router_voice = None;
         }
         store.save_preferences(&preferences)
-    });
+    })
+    .await;
     result.map_err(Into::into)
 }
 #[tauri::command]
@@ -269,7 +327,9 @@ async fn import_legacy(
     let result: IpcResult<_> = async {
         let store = Arc::clone(&state.store);
         let offline = Arc::clone(&state.offline);
+        let permit = offline.mutation_permit()?;
         tauri::async_runtime::spawn_blocking(move || {
+            let _permit = permit;
             let store = store.lock().map_err(|e| e.to_string())?;
             let result = store
                 .import_legacy(Path::new(&path))
@@ -286,11 +346,14 @@ async fn import_legacy(
 }
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned command arguments.
-fn set_background(
+async fn set_background(
     state: State<'_, AppState>,
     path: Option<String>,
 ) -> Result<Preferences, crate::ipc::IpcError> {
-    let result: IpcResult<_> = with_store(&state, |s| s.background(path.as_deref()));
+    let result: IpcResult<_> = with_store(&state, StoreAccess::Mutation, move |s| {
+        s.background(path.as_deref())
+    })
+    .await;
     result.map_err(Into::into)
 }
 #[tauri::command]
@@ -328,12 +391,19 @@ async fn set_openrouter_key(
     let result: IpcResult<_> = async {
         let api_key = zeroize::Zeroizing::new(api_key);
         credentials::validate_key(&api_key).map_err(str::to_owned)?;
-        let mut cache = state.openrouter_catalog.lock().await;
         state.speech.stop().await;
-        state.offline.change_credentials(Some(api_key)).await?;
-        *cache = None;
-        drop(cache);
-        Ok(OpenRouterStatus { has_api_key: true })
+        let cache = Arc::clone(&state.openrouter_catalog);
+        let manager = Arc::clone(&state.offline);
+        state
+            .offline
+            .run_mutation(async move {
+                let mut cache = cache.lock().await;
+                *cache = None;
+                manager.change_credentials(Some(api_key)).await?;
+                drop(cache);
+                Ok(OpenRouterStatus { has_api_key: true })
+            })
+            .await
     }
     .await;
     result.map_err(Into::into)
@@ -343,12 +413,19 @@ async fn delete_openrouter_key(
     state: State<'_, AppState>,
 ) -> Result<OpenRouterStatus, crate::ipc::IpcError> {
     let result: IpcResult<_> = async {
-        let mut cache = state.openrouter_catalog.lock().await;
         state.speech.stop().await;
-        state.offline.change_credentials(None).await?;
-        *cache = None;
-        drop(cache);
-        Ok(OpenRouterStatus { has_api_key: false })
+        let cache = Arc::clone(&state.openrouter_catalog);
+        let manager = Arc::clone(&state.offline);
+        state
+            .offline
+            .run_mutation(async move {
+                let mut cache = cache.lock().await;
+                *cache = None;
+                manager.change_credentials(None).await?;
+                drop(cache);
+                Ok(OpenRouterStatus { has_api_key: false })
+            })
+            .await
     }
     .await;
     result.map_err(Into::into)
@@ -359,7 +436,7 @@ async fn synthesize_openrouter(
     speed: f32,
 ) -> IpcResult<SpeechAudio> {
     let generation = state.speech.cancellation_generation();
-    let preferences = with_store(state, Store::preferences)?;
+    let preferences = with_store(state, StoreAccess::Read, Store::preferences).await?;
     let model = preferences
         .open_router_model
         .as_deref()
@@ -461,6 +538,7 @@ async fn prepare_shutdown(state: State<'_, AppState>) -> Result<(), crate::ipc::
         state.lifecycle.frontend_ready();
         state.offline.begin_shutdown();
         state.offline.shutdown().await;
+        state.offline.drain_mutations().await;
         state.speech.stop().await;
         state.lifecycle.mark_drained();
         Ok(())
@@ -497,7 +575,7 @@ pub fn run() -> tauri::Result<()> {
                 store,
                 speech,
                 offline,
-                openrouter_catalog: tokio::sync::Mutex::new(None),
+                openrouter_catalog: Arc::new(tokio::sync::Mutex::new(None)),
                 audio_resources: Arc::clone(&audio_resources),
             });
             Ok(())
@@ -562,6 +640,7 @@ pub fn run() -> tauri::Result<()> {
                         state.lifecycle.wait_frontend(),
                     )
                     .await;
+                    state.offline.drain_mutations().await;
                     state.lifecycle.mark_drained();
                     app.exit(code.unwrap_or(0));
                 });
@@ -582,6 +661,49 @@ mod tests {
 #[cfg(test)]
 mod provider_tests {
     use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::unwrap_used)]
+    async fn waiting_for_store_does_not_block_runtime_and_is_tracked_after_cancellation() {
+        let root =
+            std::env::temp_dir().join(format!("readio-store-block-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(Mutex::new(Store::open(&root).unwrap()));
+        let locked_store = Arc::clone(&store);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = locked_store.lock().unwrap();
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+        let tasks = tasks::Tasks::new();
+        let permit = tasks.enter().unwrap();
+        let (worker_started_tx, worker_started_rx) = tokio::sync::oneshot::channel();
+        let work = tokio::spawn(execute_store_with_start(
+            Arc::clone(&store),
+            Some(permit),
+            Store::books,
+            move || {
+                let _ = worker_started_tx.send(());
+            },
+        ));
+        worker_started_rx.await.unwrap();
+        assert!(!work.is_finished());
+        work.abort();
+        tasks.close();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), tasks.wait())
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), tasks.wait())
+            .await
+            .unwrap();
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn migrates_legacy_fish_selection_without_switching_existing_model() {
         let mut prefs = Preferences {

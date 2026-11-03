@@ -1,6 +1,6 @@
 use super::{IpcResult, OfflineManager};
+use desk_core::ChapterPlanner;
 use desk_core::{AudioBlock, AudioProfile, Book, EditionPlan, OfflineManifest};
-use desk_core::{ChapterPlanner, plan_chapter_v1};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::{collections::HashMap, sync::Arc};
@@ -81,7 +81,7 @@ impl OfflineManager {
         book_id: String,
         chapter: usize,
     ) -> IpcResult<(AudioProfile, Arc<ChapterPlan>)> {
-        let _singleflight = self.plan_gate.lock().await;
+        let _singleflight = Arc::clone(&self.plan_gate).lock_owned().await;
         let store = Arc::clone(&self.store);
         let plans = Arc::clone(&self.chapter_plans);
         let planners = Arc::clone(&self.planner);
@@ -185,13 +185,16 @@ impl OfflineManager {
         &self,
         manifest: OfflineManifest,
     ) -> IpcResult<(OfflineManifest, Arc<EditionPlan>)> {
-        let _singleflight = self.plan_gate.lock().await;
+        let singleflight = Arc::clone(&self.plan_gate).lock_owned().await;
+        let permit = self.mutation_permit()?;
         let store = Arc::clone(&self.store);
         let cache = Arc::clone(&self.cache);
         let plans = Arc::clone(&self.edition_plans);
         let manifests = Arc::clone(&self.manifest_plans);
         let (manifest, plan, epoch) =
             tauri::async_runtime::spawn_blocking(move || -> IpcResult<_> {
+                let _singleflight = singleflight;
+                let _permit = permit;
                 let epoch = {
                     let store = store.lock().map_err(|e| e.to_string())?;
                     let epoch = plans.epoch();
@@ -221,13 +224,9 @@ impl OfflineManager {
                 let plan = if let Some(digest) = &manifest.plan_digest {
                     cache.edition_plan(digest).map_err(|e| e.to_string())?
                 } else {
-                    let plan = EditionPlan::migrate_legacy(
-                        &book,
-                        &manifest.profile,
-                        &manifest.block_ids,
-                        plan_chapter_v1,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    let plan =
+                        EditionPlan::migrate_legacy(&book, &manifest.profile, &manifest.block_ids)
+                            .map_err(|e| e.to_string())?;
                     let _store = store.lock().map_err(|e| e.to_string())?;
                     if plans.epoch() != epoch {
                         return Err("Книга изменилась во время миграции".into());
