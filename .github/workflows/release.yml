@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag, for example v0.1.0
+        description: Existing version tag, for example v0.2.5
         required: true
         type: string
 
@@ -66,6 +66,12 @@ jobs:
           node-version: 24.15.0
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+      - name: Prepare release metadata
+        id: metadata
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: node scripts/prepare-release.mjs
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -79,8 +85,8 @@ jobs:
           tauriScript: npm run --prefix ../../frontend tauri
           args: --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
           tagName: ${{ steps.tag.outputs.name }}
-          releaseName: Readio ${{ steps.tag.outputs.name }}
-          releaseBody: Сборки Readio для Windows x64 и macOS Apple Silicon.
+          releaseName: Readio v${{ steps.metadata.outputs.version }}
+          releaseBody: ${{ steps.metadata.outputs.body }}
           releaseDraft: false
-          prerelease: false
+          prerelease: ${{ steps.metadata.outputs.prerelease }}
           includeUpdaterJson: false

@@ -48,8 +48,14 @@ async fn verifying_cached_audio_does_not_lock_generation_journal() {
     );
     release_tx.send(()).unwrap();
     scan.await.unwrap().unwrap();
+    let weak_journal = Arc::downgrade(&journal);
+    drop(journal);
     manager.shutdown().await;
     drop(manager);
+    assert!(
+        weak_journal.upgrade().is_none(),
+        "journal retained after shutdown"
+    );
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }

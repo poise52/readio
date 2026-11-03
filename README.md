@@ -1,65 +1,60 @@
 # Readio
 
-Настольная читалка EPUB, FB2 и TXT с синтезом речи. Книги, настройки, закладки и позиция хранятся в SQLite в каталоге данных приложения.
+English | [Русский](README.ru.md)
 
-## Разработка и сборка
+Readio is a desktop EPUB, FB2 and TXT reader with speech synthesis. Books, settings, bookmarks and reading positions are stored in SQLite in the application data directory. The application interface is currently in Russian.
 
-Установите Rust 1.99.1, Node.js 24.15.0 и [системные зависимости Tauri v2](https://v2.tauri.app/start/prerequisites/). Затем выполните:
+## Install
+
+Download an installer from [GitHub Releases](https://github.com/poise52/readio/releases). Builds target Windows 11 x64 and macOS on Apple Silicon. The Windows installer is not signed with a publisher certificate. The macOS build is ad-hoc signed and not notarized by Apple; Gatekeeper may require you to allow it in Privacy & Security on first launch.
+
+## Speech engines
+
+- **OpenRouter:** create an [API key](https://openrouter.ai/settings/keys), save it in Readio settings, and select a TTS model and, where available, a voice. The key is stored in macOS Keychain or Windows Credential Manager, not in SQLite or book settings. The catalog includes paid and free models; availability and prices depend on OpenRouter and your account.
+- **Edge:** online speech with built-in Dmitry and Svetlana voices. Voice preview uses the selected engine.
+- **Piper:** install Piper separately along with an ONNX voice model and its `.onnx.json` configuration. Put the executable in `piper/` under Readio's data directory or add it to `PATH`, and put models in `models/piper/`. Alternatively set `READIO_PIPER_BIN` and `READIO_PIPER_MODELS` to their respective paths. Model language is read from its configuration.
+
+Configure audio format and text limits per OpenRouter model according to the provider's documentation. Readio does not infer provider limits from model IDs. PCM output requires explicit sample rate and channel count; mono PCM16 is supported.
+
+## Offline listening and costs
+
+Before downloading a book, Readio displays the voice and an estimate for remaining blocks and asks for confirmation. OpenRouter does not specify the billing unit in its model pricing API, so paid-model estimates remain unknown until you select a unit based on the provider's documentation. Estimates use that unit and API rates, are not actual charges, and exclude unknown extra fees.
+
+You can set a limit on new requests and a USD budget for each download or resume. Cached blocks do not consume the request limit. Unknown costs require separate confirmation and a new-request limit. The budget is checked before each request; a rate change can cause an already submitted request to exceed it. Actual expenses are tracked separately when the provider reports them; **Reconcile costs** checks previous attempts without generating speech again.
+
+Downloaded audio plays without a network connection or API key and keeps the model, voice and dictionary selected at download time. Unfinished downloads can be resumed manually after restarting, with a fresh estimate. Pausing does not cancel a request already sent; its completed audio is cached. Removing an offline edition unpins its blocks. Temporary cache is limited to 1 GiB; pinned editions are excluded. Position within a block is preserved between launches. Valid Edge timing data supports text highlighting and navigation; without suitable timing data, text navigation is approximate.
+
+Generation attempts are recorded before OpenRouter requests are sent. If a request's outcome is unknown after a crash, existing valid cached audio is reused; otherwise retrying requires explicit consent because another charge is possible. Provider idempotency and single billing after a connection failure are not guaranteed. On exit, Readio stops accepting new generation requests and waits for submitted blocks to be saved. Only one Readio process can use a data directory at a time.
+
+Back up the entire application data directory, including `audio-cache/editions`, `manifests` and `blocks`. A damaged edition manifest does not block other books; the diagnostic banner can restore it from a JSON backup after checking its identity. This restores the description and pins, not deleted audio or a missing plan file. Automatic audio eviction is suspended while references from a damaged manifest are unknown.
+
+Import supports UTF-8, UTF-16 with BOM and declared XML encodings including Windows-1251. Unknown encodings are not silently substituted. Batch imports are transactional: an error prevents a partial import.
+
+## Development and builds
+
+Install Rust 1.99.1, Node.js 24.15.0 and the [Tauri v2 system prerequisites](https://v2.tauri.app/start/prerequisites/), then run:
 
 ```sh
 npm --prefix frontend ci
 npm --prefix frontend run tauri -- dev
 ```
 
-Проверка: `cargo test --workspace`, `npm --prefix frontend run typecheck`. Для сборки установщика Windows x64:
+Checks:
+
+```sh
+cargo test --workspace
+npm --prefix frontend run typecheck
+npm --prefix frontend test
+```
+
+On Windows, install MSVC C++ Build Tools and make NASM available in `PATH`. Build the Windows x64 installer on Windows:
 
 ```sh
 npm --prefix frontend run tauri -- build --target x86_64-pc-windows-msvc
 ```
 
-На macOS используйте `npm --prefix frontend run tauri -- build` без параметра `--target`.
+On an Apple Silicon Mac, use `npm --prefix frontend run tauri -- build`.
 
-## Сборки в GitHub Actions
+The `CI` GitHub Actions workflow runs on pushes and pull requests and can also be run manually. Its artifacts contain a Windows x64 NSIS installer and macOS Apple Silicon DMG and application ZIP. CI does not publish releases.
 
-Workflow `CI` запускается при push и pull request. Его также можно запустить вручную: **Actions → CI → Run workflow**, затем выбрать ветку. После успешного запуска файлы доступны в разделе **Artifacts** на странице этого запуска:
-
-- `readio-windows11-x64-installer` — установщик NSIS для Windows x64.
-- `readio-macos-apple-silicon` — DMG и ZIP с приложением для Mac на Apple Silicon.
-
-Сборка macOS имеет ad-hoc подпись и не нотариально заверена Apple. При первом запуске Gatekeeper может потребовать разрешить открытие приложения в настройках «Конфиденциальность и безопасность». Установщик Windows также не подписан сертификатом издателя. Workflow `CI` не публикует GitHub Releases.
-
-## Офлайн-прослушивание
-
-Кнопка загрузки аудиокниги сначала показывает выбранный голос и оценку стоимости оставшихся фрагментов. API OpenRouter не указывает единицу тарификации модели, поэтому для платных моделей стоимость неизвестна, пока вы сами не выберете единицу по документации поставщика. Расчёт использует указанную вами единицу и ставки API; он не является фактическим списанием и не включает неизвестные дополнительные тарифы. Генерация начинается только после подтверждения. После перезапуска приложения незавершённую загрузку можно возобновить вручную, запросив новую оценку.
-
-Перед запуском можно ограничить число новых запросов и задать денежный порог в USD. Ограничения относятся к одному явному запуску или возобновлению загрузки; готовые блоки повторно лимит не расходуют. При неизвестной стоимости требуется отдельное подтверждение и лимит новых запросов. Денежный порог проверяется перед отправкой следующего блока, но изменение тарифа может привести к превышению порога уже отправленным запросом. История фактических расходов хранится отдельно от оценки; кнопка «Сверить расходы» запрашивает сведения о прежних попытках без повторного синтеза. Пока поставщик не сообщил стоимость, она остаётся неизвестной.
-
-Сохранённая версия использует зафиксированные при загрузке модель, голос и словарь, даже если текущие настройки изменились. Уже сохранённые фрагменты воспроизводятся без сети и API-ключа. Пауза не прерывает отправленный запрос: готовый фрагмент сохраняется в кэш. Удаление офлайн-версии снимает закрепление её фрагментов. Временный кэш ограничен 1 ГиБ; закреплённые офлайн-версии в этот лимит не входят. Точное время внутри блока сохраняется между запусками. Проверенные временные метки Edge управляют переходами и подсветкой; без подходящих меток переходы по тексту явно обозначаются как приблизительные.
-
-Офлайн-издание хранит отдельный план с версией, хешем источника и картой блоков. При воспроизведении и продолжении загрузки используется сохранённая разбивка. Старые манифесты мигрируют только при точном совпадении всех ID блоков со старым планировщиком; несовпадение останавливает операцию без перегенерации. План записывается перед началом загрузки, просмотр расчёта не создаёт его файл. Защитные лимиты приложения — 8 МиБ для лёгкого манифеста и 64 МиБ для файла плана; это не лимиты текста API-модели.
-
-Повреждённое описание издания не блокирует остальные книги. Пока его ссылки на аудио неизвестны, автоматическое вытеснение аудио приостановлено. Баннер диагностики позволяет восстановить манифест из JSON-резервной копии; имя и идентичность издания проверяются до замены. Это восстанавливает описание и закрепление файлов, но не возвращает удалённое аудио или отсутствующий файл плана. При резервном копировании сохраняйте весь каталог данных приложения, включая `audio-cache/editions`, `manifests` и `blocks`.
-
-Планы текущих глав кэшируются с ограничением памяти и сбрасываются при изменении библиотеки. Тексты остальных глав не передаются в ответе открытия книги; большой одноглавный TXT по-прежнему передаёт passages всей текущей главы.
-
-При паузе и переходах к другому месту неотправленные запросы отзываются. Общий запрос плеера и офлайн-загрузки выполняется один раз, пока нужен хотя бы одному из них. При закрытии окна или системном Quit приложение прекращает принимать генерации и дожидается сохранения уже отправленных блоков. Один каталог данных может использовать только один процесс Readio.
-
-Попытки генерации блоков OpenRouter записываются в SQLite до отправки запроса; `X-Generation-Id` сохраняется после получения заголовков. После аварийного выхода результат отправленного, но не завершённого запроса считается неизвестным. Если валидное аудио уже есть в кэше, оно используется без нового запроса. При отсутствии аудио повтор требует отдельного согласия с предупреждением о возможном повторном списании; для полной книги оно относится только к блокам из текущего расчёта. Идемпотентность провайдера и однократное списание при обрыве связи не гарантируются. На Unix каталог кэша синхронизируется после переименования; на Windows сохранность переименования после потери питания зависит от файловой системы.
-
-Журнал сопоставляет одинаковое аудио по каноническому ID блока и хешу текста, независимо от изменений словаря и лимитов профиля, не повлиявших на этот текст. Разрешение повтора проверяется на конкретный ID попытки внутри транзакции; согласие на прежнюю ошибку не разрешает повтор новой.
-
-## Публикация релиза
-
-Workflow `Release` собирает установщики и публикует их в GitHub Releases при отправке тега вида `v*`. Для уже существующего тега откройте **Actions → Release → Run workflow**, выберите ветку с workflow и укажите тег, например `v0.1.0`. Сборка использует код из указанного тега; тег должен уже существовать и содержать файлы приложения и сборки.
-
-Workflow использует автоматически предоставляемый GitHub Actions `GITHUB_TOKEN` с разрешением `contents: write`; отдельные секреты и `.env` не требуются. Проверки кода запускает отдельный workflow `CI`. macOS-сборка имеет только ad-hoc подпись без нотариального заверения, Windows-установщик не подписан сертификатом издателя.
-
-## Синтез речи
-
-Для синтеза через OpenRouter создайте API-ключ в [OpenRouter](https://openrouter.ai/settings/keys) и сохраните его в настройках Readio. Ключ хранится в macOS Keychain или Windows Credential Manager и не включается в SQLite или настройки книги. Выберите TTS-модель из каталога OpenRouter и, при наличии, её голос. В каталоге есть платные и бесплатные модели; цены и доступность зависят от OpenRouter и вашего аккаунта.
-
-Формат и лимит текста настраиваются отдельно для каждой модели. Приложение не угадывает их по model ID и не считает внутренний размер блока подтверждённым лимитом провайдера. Для PCM нужны явно заданные частота и число каналов; поддерживается моно PCM16. Источник ставки API, время проверки и ручная единица оценки показываются отдельно.
-
-Голоса Edge работают через интернет; встроенный список поддерживает Дмитрия и Светлану. Preview использует выбранный движок без автоматической подмены. Для локальной речи установите Piper и ONNX-модель вместе с её файлом `.onnx.json`; язык читается из конфигурации модели. Поместите исполняемый файл в `piper/` внутри каталога данных Readio либо добавьте его в `PATH`. Модели поместите в `models/piper/` внутри того же каталога. Переменные `READIO_PIPER_BIN` и `READIO_PIPER_MODELS` позволяют указать другие пути к исполняемому файлу и каталогу моделей. Замена модели, конфигурации или исполняемого файла создаёт новый профиль кэша; сохранённые издания продолжают использовать готовое аудио.
-
-Импорт поддерживает UTF-8, UTF-16 с BOM и объявленные XML-кодировки, включая Windows-1251. Неизвестная кодировка не подменяется молча. Набор книг обрабатывается последовательно в одной транзакции с общим лимитом входа и подготовленного текста; при ошибке набор не импортируется частично.
+The `Release` workflow publishes installers for a pushed `v*` tag. To run it for an existing tag, use **Actions → Release → Run workflow** and enter, for example, `v0.2.5`. The tag must already exist and contain the application, build files and release notes at `docs/releases/<tag>.md`; its version must match the Cargo, Tauri and frontend versions. See the [v0.2.5 release notes](docs/releases/v0.2.5.md). Prerelease tags produce GitHub prereleases. The workflow uses the automatically provided `GITHUB_TOKEN` with `contents: write`; it needs no separate secrets or `.env`. Code checks run in the separate `CI` workflow. The signing limitations above apply to release builds.
